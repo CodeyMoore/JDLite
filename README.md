@@ -1,6 +1,6 @@
 # JDLite
 
-** ⚠️ Disclaimer ⚠️ **
+⚠️** Disclaimer **⚠️
 
 JDLite was developed entirely using AI.
 As a result, bugs, unexpected behaviour, and other issues may occur. Features may not always work as intended, and users should exercise discretion when using the application.
