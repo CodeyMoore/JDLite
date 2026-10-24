@@ -29,7 +29,8 @@ jobs:
           test -d "$EXT"
 
           # Safari only loads the extension if these sit at the top of the .appex.
-          for f in manifest.json popup.html popup.js popup.css content.js; do
+          for f in manifest.json popup.html popup.js popup.css content.js \
+                   icon-48.png icon-128.png icon-512.png toolbar-icon-38.png; do
             if [ ! -f "$EXT/$f" ]; then
               echo "::error::$f is missing from the top level of the Safari extension"
               find "$EXT" -maxdepth 2 -print
@@ -40,6 +41,14 @@ jobs:
           rm -rf Payload JDLite.ipa
           mkdir Payload
           ditto "$APP" Payload/JDLite.app
+
+          # The app icon is compiled from Assets.xcassets into the app's Info.plist.
+          if ! plutil -p Payload/JDLite.app/Info.plist | grep -q CFBundleIcons; then
+            echo "::error::The app icon wasn't compiled into the app"
+            exit 1
+          fi
+          echo "App: $(plutil -extract CFBundleIdentifier raw Payload/JDLite.app/Info.plist)"
+          echo "Extension: $(plutil -extract CFBundleIdentifier raw "$EXT/Info.plist")"
 
           # iOS only finds extensions in a folder named exactly "PlugIns". This Mac
           # ignores letter case, so no other folder in the app may be called "plugins".
