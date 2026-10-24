@@ -86,3 +86,4 @@ targets:
         CFBundleVersion: "4"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
+
