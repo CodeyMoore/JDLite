@@ -23,14 +23,41 @@ jobs:
       - name: Package IPA
         run: |
           OUT=build/Build/Products/Release-iphoneos
-          test -d "$OUT/JDLite.app"
-          test -d "$OUT/JDLiteExtension.appex"
-          mkdir -p "$OUT/JDLite.app/PlugIns"
-          cp -R "$OUT/JDLiteExtension.appex" "$OUT/JDLite.app/PlugIns/"
+          APP="$OUT/JDLite.app"
+          EXT="$OUT/JDLiteExtension.appex"
+          test -d "$APP"
+          test -d "$EXT"
+
+          # Safari only loads the extension if these sit at the top of the .appex.
+          for f in manifest.json popup.html popup.js popup.css content.js; do
+            if [ ! -f "$EXT/$f" ]; then
+              echo "::error::$f is missing from the top level of the Safari extension"
+              find "$EXT" -maxdepth 2 -print
+              exit 1
+            fi
+          done
+
+          rm -rf Payload JDLite.ipa
           mkdir Payload
-          cp -R "$OUT/JDLite.app" Payload/
-          zip -qry JDLite.ipa Payload
-          unzip -l JDLite.ipa | grep -E "Info.plist|\.appex/" | head -n 10
+          ditto "$APP" Payload/JDLite.app
+
+          # iOS only finds extensions in a folder named exactly "PlugIns". This Mac
+          # ignores letter case, so no other folder in the app may be called "plugins".
+          CLASH=$(ls Payload/JDLite.app | grep -ix "plugins" || true)
+          if [ -n "$CLASH" ] && [ "$CLASH" != "PlugIns" ]; then
+            echo "::error::The app has a folder called '$CLASH', which clashes with PlugIns"
+            exit 1
+          fi
+          mkdir -p Payload/JDLite.app/PlugIns
+          ditto "$EXT" Payload/JDLite.app/PlugIns/JDLiteExtension.appex
+
+          zip -qr JDLite.ipa Payload
+          if ! unzip -l JDLite.ipa | grep -q "Payload/JDLite.app/PlugIns/JDLiteExtension.appex/manifest.json"; then
+            echo "::error::The Safari extension isn't in the IPA's PlugIns folder"
+            unzip -l JDLite.ipa | grep -i "appex" | head -n 20
+            exit 1
+          fi
+          echo "Safari extension packaged in PlugIns/JDLiteExtension.appex"
 
       - uses: actions/upload-artifact@v6
         with:
