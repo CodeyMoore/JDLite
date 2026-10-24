@@ -69,7 +69,8 @@ final class PluginHost: ObservableObject {
     private func installBundledPlugins() {
         let fm = FileManager.default
         try? fm.createDirectory(at: Self.pluginsDir, withIntermediateDirectories: true)
-        guard let src = Bundle.main.url(forResource: "Plugins", withExtension: nil),
+        // Not "Plugins": that name clashes with the app's "PlugIns" extension folder.
+        guard let src = Bundle.main.url(forResource: "BuiltInPlugins", withExtension: nil),
               let files = try? fm.contentsOfDirectory(at: src, includingPropertiesForKeys: nil) else { return }
         // Built-in plugins are refreshed on every launch; to customise one,
         // copy it under a different file name.

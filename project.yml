@@ -9,8 +9,10 @@ targets:
     platform: iOS
     sources:
       - path: JDLite
-        excludes: ["Plugins/**"]
-      - path: JDLite/Plugins
+        excludes: ["BuiltInPlugins/**", "Plugins/**"]
+      # Bundled JS plugins. Not named "Plugins": the build machine ignores letter
+      # case, so it would clash with the app's "PlugIns" extension folder.
+      - path: JDLite/BuiltInPlugins
         type: folder
     dependencies:
       - target: JDLiteExtension
