@@ -7,7 +7,11 @@ targets:
   JDLite:
     type: application
     platform: iOS
-    sources: [JDLite]
+    sources:
+      - path: JDLite
+        excludes: ["Plugins/**"]
+      - path: JDLite/Plugins
+        type: folder
     dependencies:
       - target: JDLiteExtension
     settings:

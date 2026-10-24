@@ -1,8 +1,13 @@
 import SwiftUI
 
 struct ContentView: View {
+    enum Sheet: Identifiable {
+        case add, accounts, plugins
+        var id: Self { self }
+    }
+
     @EnvironmentObject var manager: DownloadManager
-    @State private var showAdd = false
+    @State private var sheet: Sheet?
 
     var body: some View {
         NavigationStack {
@@ -26,13 +31,25 @@ struct ContentView: View {
             .navigationTitle("JDLite")
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Clear done") { manager.clearCompleted() }
+                    Menu {
+                        Button("Accounts", systemImage: "person.crop.circle") { sheet = .accounts }
+                        Button("Plugins", systemImage: "puzzlepiece.extension") { sheet = .plugins }
+                        Divider()
+                        Button("Clear completed", systemImage: "checkmark.circle") { manager.clearCompleted() }
+                    } label: { Image(systemName: "ellipsis.circle") }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showAdd = true } label: { Image(systemName: "plus") }
+                    Button { sheet = .add } label: { Image(systemName: "plus") }
                 }
             }
-            .sheet(isPresented: $showAdd) { AddLinksView() }
+            .sheet(item: $sheet) { s in
+                switch s {
+                case .add: AddLinksView()
+                case .accounts: AccountsView()
+                case .plugins: PluginsView()
+                }
+            }
+            .task { await PluginHost.shared.ensureLoaded() }
         }
     }
 }
@@ -48,10 +65,12 @@ struct DownloadRow: View {
                 if item.state == .downloading || item.state == .paused {
                     ProgressView(value: item.progress)
                 }
-                Text(statusText).font(.caption).foregroundStyle(.secondary)
+                Text(statusText).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
             Spacer()
-            if let symbol = actionSymbol {
+            if item.state == .resolving {
+                ProgressView()
+            } else if let symbol = actionSymbol {
                 Button { act() } label: { Image(systemName: symbol).font(.title3) }
                     .buttonStyle(.borderless)
             }
@@ -65,6 +84,7 @@ struct DownloadRow: View {
     private var statusText: String {
         switch item.state {
         case .queued: return "Queued"
+        case .resolving: return "Resolving…"
         case .downloading:
             return item.bytesTotal > 0 ? "\(fmt(item.bytesReceived)) / \(fmt(item.bytesTotal))" : fmt(item.bytesReceived)
         case .paused: return "Paused"

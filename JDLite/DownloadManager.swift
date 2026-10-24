@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-enum DownloadState: String, Codable { case queued, downloading, paused, completed, failed }
+enum DownloadState: String, Codable { case queued, resolving, downloading, paused, completed, failed }
 
 struct DownloadItem: Identifiable, Codable {
     var id = UUID()
@@ -12,6 +12,9 @@ struct DownloadItem: Identifiable, Codable {
     var bytesTotal: Int64 = 0
     var resumeData: Data?
     var error: String?
+    var headers: [String: String]?   // from a plugin, sent with the download
+    var needsResolve: Bool?          // true until plugins have had a look at the URL
+    var preferredName: String?       // file name chosen by a plugin
     var progress: Double { bytesTotal > 0 ? Double(bytesReceived) / Double(bytesTotal) : 0 }
 }
 
@@ -45,13 +48,19 @@ final class DownloadManager: NSObject, ObservableObject {
     // MARK: Public API
 
     func add(urls: [URL]) {
+        var ids: [UUID] = []
         for url in urls where !items.contains(where: { $0.url == url && $0.state != .completed }) {
             var name = url.lastPathComponent
             if name.isEmpty || name == "/" { name = url.host ?? "download" }
-            items.append(DownloadItem(url: url, fileName: name.replacingOccurrences(of: "/", with: "_")))
+            let item = DownloadItem(url: url,
+                                    fileName: name.replacingOccurrences(of: "/", with: "_"),
+                                    state: .resolving,
+                                    needsResolve: true)
+            items.append(item)
+            ids.append(item.id)
         }
         save()
-        startNext()
+        for id in ids { Task { await runResolve(id) } }
     }
 
     /// Handles jdlite://add?u=<url>&u=<url> links sent by the Safari extension.
@@ -67,16 +76,22 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     func resume(_ id: UUID) {
-        mutate(id) { $0.state = .queued }
-        startNext()
+        guard let item = items.first(where: { $0.id == id }) else { return }
+        if item.needsResolve == true {
+            mutate(id) { $0.state = .resolving; $0.error = nil }
+            Task { await runResolve(id) }
+        } else {
+            mutate(id) { $0.state = .queued; $0.error = nil }
+            startNext()
+        }
     }
 
     func pause(_ id: UUID) {
-        guard let item = items.first(where: { $0.id == id }) else { return }
+        guard let item = items.first(where: { $0.id == id }), item.state != .resolving else { return }
         if item.state == .queued { mutate(id) { $0.state = .paused }; return }
         let key = id.uuidString
         session.getTasksWithCompletionHandler { _, _, downloads in
-            guard let t = downloads.first(where: { $0.taskDescription == key }) else { return }
+            guard let t = downloads.first(where: { $0.taskDescription?.hasPrefix(key) == true }) else { return }
             t.cancel(byProducingResumeData: { data in
                 Task { @MainActor in
                     self.mutate(id) { $0.resumeData = data; $0.state = .paused }
@@ -89,7 +104,7 @@ final class DownloadManager: NSObject, ObservableObject {
     func remove(_ id: UUID) {
         let key = id.uuidString
         session.getTasksWithCompletionHandler { _, _, downloads in
-            downloads.first(where: { $0.taskDescription == key })?.cancel()
+            downloads.first(where: { $0.taskDescription?.hasPrefix(key) == true })?.cancel()
         }
         items.removeAll { $0.id == id }
         save()
@@ -113,6 +128,44 @@ final class DownloadManager: NSObject, ObservableObject {
         return out
     }
 
+    // MARK: Plugin resolving
+
+    private func runResolve(_ id: UUID) async {
+        guard let item = items.first(where: { $0.id == id }) else { return }
+        await PluginHost.shared.ensureLoaded()
+
+        guard let plugin = PluginHost.shared.match(item.url) else {
+            mutate(id) { $0.state = .queued; $0.needsResolve = nil }
+            startNext()
+            return
+        }
+        let account = AccountStore.shared.account(for: item.url, plugin: plugin)
+        do {
+            let links = try await PluginHost.shared.resolve(plugin: plugin, url: item.url, account: account)
+            guard items.contains(where: { $0.id == id }) else { return } // removed while resolving
+            let first = links[0]
+            mutate(id) {
+                $0.url = first.url
+                $0.fileName = first.fileName ?? first.url.lastPathComponent
+                $0.preferredName = first.fileName
+                $0.headers = first.headers
+                $0.state = .queued
+                $0.needsResolve = nil
+                $0.error = nil
+            }
+            for link in links.dropFirst() {
+                items.append(DownloadItem(url: link.url,
+                                          fileName: link.fileName ?? link.url.lastPathComponent,
+                                          headers: link.headers,
+                                          preferredName: link.fileName))
+            }
+            save()
+            startNext()
+        } catch {
+            mutate(id) { $0.state = .failed; $0.error = error.localizedDescription }
+        }
+    }
+
     // MARK: Queue
 
     private func startNext() {
@@ -129,9 +182,13 @@ final class DownloadManager: NSObject, ObservableObject {
         if let data = item.resumeData {
             task = session.downloadTask(withResumeData: data)
         } else {
-            task = session.downloadTask(with: item.url)
+            var req = URLRequest(url: item.url)
+            for (k, v) in item.headers ?? [:] { req.setValue(v, forHTTPHeaderField: k) }
+            task = session.downloadTask(with: req)
         }
-        task.taskDescription = item.id.uuidString
+        var desc = item.id.uuidString
+        if let n = item.preferredName, !n.isEmpty { desc += "\n" + n }
+        task.taskDescription = desc
         task.resume()
         items[i].state = .downloading
         items[i].resumeData = nil
@@ -141,13 +198,16 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private func reconcile() {
         session.getTasksWithCompletionHandler { _, _, downloads in
-            let live = Set(downloads.compactMap { $0.taskDescription })
+            let live = Set(downloads.compactMap { Self.parseDesc($0.taskDescription)?.id })
             Task { @MainActor in
-                for i in self.items.indices
-                where self.items[i].state == .downloading && !live.contains(self.items[i].id.uuidString) {
-                    self.items[i].state = .queued
+                var toResolve: [UUID] = []
+                for i in self.items.indices {
+                    let it = self.items[i]
+                    if it.state == .downloading && !live.contains(it.id) { self.items[i].state = .queued }
+                    if it.state == .resolving { toResolve.append(it.id) }
                 }
                 self.save()
+                for id in toResolve { Task { await self.runResolve(id) } }
                 self.startNext()
             }
         }
@@ -179,6 +239,13 @@ final class DownloadManager: NSObject, ObservableObject {
 
     // MARK: Files
 
+    nonisolated static func parseDesc(_ s: String?) -> (id: UUID, name: String?)? {
+        guard let s else { return nil }
+        let parts = s.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let first = parts.first, let id = UUID(uuidString: String(first)) else { return nil }
+        return (id, parts.count > 1 ? String(parts[1]) : nil)
+    }
+
     nonisolated static var downloadsDir: URL {
         let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Downloads")
@@ -206,7 +273,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                                 didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                                 totalBytesExpectedToWrite: Int64) {
-        guard let s = downloadTask.taskDescription, let id = UUID(uuidString: s) else { return }
+        guard let d = Self.parseDesc(downloadTask.taskDescription) else { return }
+        let id = d.id
         Task { @MainActor in
             self.mutate(id, persist: false) {
                 $0.bytesReceived = totalBytesWritten
@@ -217,7 +285,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
 
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                                 didFinishDownloadingTo location: URL) {
-        guard let s = downloadTask.taskDescription, let id = UUID(uuidString: s) else { return }
+        guard let d = Self.parseDesc(downloadTask.taskDescription) else { return }
+        let id = d.id
 
         if let http = downloadTask.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let code = http.statusCode
@@ -229,7 +298,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
         }
 
         // The temp file is deleted when this method returns, so move it now.
-        let name = (downloadTask.response?.suggestedFilename ?? "download")
+        let hint = (d.name?.isEmpty == false) ? d.name : nil
+        let name = (hint ?? downloadTask.response?.suggestedFilename ?? "download")
             .replacingOccurrences(of: "/", with: "_")
         let dest = Self.uniqueURL(for: name)
         do {
@@ -256,7 +326,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
     }
 
     nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let error, let s = task.taskDescription, let id = UUID(uuidString: s) else { return }
+        guard let error, let d = Self.parseDesc(task.taskDescription) else { return }
+        let id = d.id
         let ns = error as NSError
         if ns.code == NSURLErrorCancelled { return } // pause/remove handle their own state
         let data = ns.userInfo[NSURLSessionDownloadTaskResumeData] as? Data
