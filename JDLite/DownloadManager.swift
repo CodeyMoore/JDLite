@@ -19,7 +19,15 @@ struct DownloadItem: Identifiable, Codable {
     var sourceURL: URL?              // the link as it was added
     var torboxId: Int?               // TorBox web download ID
     var torboxFileId: Int?           // file inside that TorBox download
-    var progress: Double { bytesTotal > 0 ? Double(bytesReceived) / Double(bytesTotal) : 0 }
+    var cloudProgress: Double?       // how far TorBox has fetched the file (0...1)
+    var savedName: String?           // file name in Downloads once finished
+    var addedAt: Date?
+    var completedAt: Date?
+
+    var progress: Double { bytesTotal > 0 ? min(Double(bytesReceived) / Double(bytesTotal), 1) : 0 }
+
+    /// The finished file in Downloads, if there is one.
+    var savedFileName: String? { savedName ?? (state == .completed ? fileName : nil) }
 }
 
 @MainActor
@@ -27,11 +35,14 @@ final class DownloadManager: NSObject, ObservableObject {
     static let shared = DownloadManager()
 
     @Published private(set) var items: [DownloadItem] = []
+    /// Current speed (bytes per second) of each running download.
+    @Published private(set) var speeds: [UUID: Double] = [:]
     @Published var maxConcurrent = 3
     var backgroundCompletionHandler: (() -> Void)?
 
     private var session: URLSession!
     private var torboxPoller: Task<Void, Never>?
+    private var samples: [UUID: (time: TimeInterval, bytes: Int64)] = [:]
     private let storeURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -61,6 +72,7 @@ final class DownloadManager: NSObject, ObservableObject {
             item.state = .resolving
             item.needsResolve = true
             item.sourceURL = url
+            item.addedAt = Date()
             items.append(item)
             ids.append(item.id)
         }
@@ -102,6 +114,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 guard let t = downloads.first(where: { $0.taskDescription?.hasPrefix(key) == true }) else { return }
                 t.cancel(byProducingResumeData: { data in
                     Task { @MainActor in
+                        self.clearTransfer(id)
                         self.mutate(id) { $0.resumeData = data; $0.state = .paused }
                         self.startNext()
                     }
@@ -112,16 +125,29 @@ final class DownloadManager: NSObject, ObservableObject {
         }
     }
 
-    func remove(_ id: UUID) {
-        let key = id.uuidString
+    /// Removes downloads from the list and deletes their files: the finished file,
+    /// or whatever was downloaded so far.
+    func delete(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
         session.getTasksWithCompletionHandler { _, _, downloads in
-            downloads.first(where: { $0.taskDescription?.hasPrefix(key) == true })?.cancel()
+            for task in downloads {
+                if let d = Self.parseDesc(task.taskDescription), ids.contains(d.id) { task.cancel() }
+            }
         }
-        items.removeAll { $0.id == id }
+        let remaining = items.filter { !ids.contains($0.id) }
+        let stillUsed = Set(remaining.compactMap { $0.savedFileName })
+        for item in items where ids.contains(item.id) {
+            clearTransfer(item.id)
+            if let name = item.savedFileName, !stillUsed.contains(name) {
+                try? FileManager.default.removeItem(at: Self.downloadsDir.appendingPathComponent(name))
+            }
+        }
+        items = remaining
         save()
         startNext()
     }
 
+    /// Removes finished downloads from the list. Their files stay in Downloads.
     func clearCompleted() {
         items.removeAll { $0.state == .completed }
         save()
@@ -210,6 +236,7 @@ final class DownloadManager: NSObject, ObservableObject {
             extra.headers = link.headers
             extra.preferredName = link.fileName
             extra.sourceURL = origin
+            extra.addedAt = Date()
             items.append(extra)
         }
         save()
@@ -240,15 +267,18 @@ final class DownloadManager: NSObject, ObservableObject {
                     strikes[item.id] = nil
                     guard isResolving(item.id) else { continue }
                     if let failure = dl.failure {
-                        mutate(item.id) { $0.torboxId = nil }   // retry adds the link to TorBox again
+                        mutate(item.id) { $0.torboxId = nil; $0.cloudProgress = nil }   // retry adds it again
                         failResolve(item.id, "TorBox: " + failure)
                     } else if dl.ready {
                         torboxReady(item.id, webId: webId, files: dl.files)
                     } else {
-                        setStatus(item.id, dl.statusText)
+                        mutate(item.id, persist: false) {
+                            $0.status = dl.statusText
+                            $0.cloudProgress = dl.fraction
+                        }
                     }
                 } catch TorBoxError.gone {
-                    mutate(item.id) { $0.torboxId = nil }
+                    mutate(item.id) { $0.torboxId = nil; $0.cloudProgress = nil }
                     failResolve(item.id, "TorBox: " + (TorBoxError.gone.errorDescription ?? "download gone"))
                 } catch is URLError {
                     let n = (strikes[item.id] ?? 0) + 1
@@ -276,6 +306,8 @@ final class DownloadManager: NSObject, ObservableObject {
             $0.fileName = first.name
             $0.preferredName = first.name
             $0.sourceURL = origin
+            if let size = first.size, size > 0 { $0.bytesTotal = size }
+            $0.cloudProgress = nil
             $0.state = .queued
             $0.needsResolve = nil
             $0.status = nil
@@ -287,6 +319,8 @@ final class DownloadManager: NSObject, ObservableObject {
             extra.sourceURL = origin
             extra.torboxId = webId
             extra.torboxFileId = file.id
+            extra.bytesTotal = max(file.size ?? 0, 0)
+            extra.addedAt = Date()
             items.append(extra)
         }
         save()
@@ -339,6 +373,7 @@ final class DownloadManager: NSObject, ObservableObject {
         var desc = item.id.uuidString
         if let n = item.preferredName, !n.isEmpty { desc += "\n" + n }
         task.taskDescription = desc
+        clearTransfer(item.id)
         task.resume()
         items[i].state = .downloading
         items[i].resumeData = nil
@@ -378,7 +413,49 @@ final class DownloadManager: NSObject, ObservableObject {
 
     fileprivate func advance() { startNext() }
 
+    // MARK: Transfer updates (called from the URLSession delegate)
+
+    fileprivate func progressed(_ id: UUID, written: Int64, expected: Int64) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if let last = samples[id] {
+            let dt = now - last.time
+            if dt < 0.5 { return }   // at most two screen updates a second per download
+            let instant = max(0, Double(written - last.bytes) / dt)
+            speeds[id] = speeds[id].map { $0 * 0.6 + instant * 0.4 } ?? instant
+        }
+        samples[id] = (time: now, bytes: written)
+        mutate(id, persist: false) {
+            $0.bytesReceived = written
+            if expected > 0 { $0.bytesTotal = expected }
+        }
+    }
+
+    fileprivate func clearTransfer(_ id: UUID) {
+        samples[id] = nil
+        speeds[id] = nil
+    }
+
+    fileprivate func finished(_ id: UUID, savedName: String, size: Int64) {
+        clearTransfer(id)
+        guard items.contains(where: { $0.id == id }) else {
+            // Deleted while it was finishing: don't leave the file behind.
+            try? FileManager.default.removeItem(at: Self.downloadsDir.appendingPathComponent(savedName))
+            return
+        }
+        mutate(id) {
+            $0.state = .completed
+            $0.fileName = savedName
+            $0.savedName = savedName
+            $0.bytesReceived = size
+            $0.bytesTotal = size
+            $0.completedAt = Date()
+            $0.error = nil
+        }
+        startNext()
+    }
+
     fileprivate func downloadFailed(_ id: UUID, message: String) {
+        clearTransfer(id)
         mutate(id) {
             $0.state = .failed
             $0.error = message
@@ -393,6 +470,7 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     fileprivate func gotWebPage(_ id: UUID) {
+        clearTransfer(id)
         let hint: String
         if TorBox.shared.isActive {
             hint = "TorBox doesn't list this site as supported."
@@ -477,10 +555,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         guard let d = Self.parseDesc(downloadTask.taskDescription) else { return }
         let id = d.id
         Task { @MainActor in
-            self.mutate(id, persist: false) {
-                $0.bytesReceived = totalBytesWritten
-                $0.bytesTotal = max(totalBytesExpectedToWrite, 0)
-            }
+            self.progressed(id, written: totalBytesWritten, expected: totalBytesExpectedToWrite)
         }
     }
 
@@ -520,18 +595,11 @@ extension DownloadManager: URLSessionDownloadDelegate {
             let attrs = try? FileManager.default.attributesOfItem(atPath: dest.path)
             let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
             let finalName = dest.lastPathComponent
-            Task { @MainActor in
-                self.mutate(id) {
-                    $0.state = .completed
-                    $0.fileName = finalName
-                    $0.bytesReceived = size
-                    $0.bytesTotal = size
-                }
-                self.advance()
-            }
+            Task { @MainActor in self.finished(id, savedName: finalName, size: size) }
         } catch {
             let msg = error.localizedDescription
             Task { @MainActor in
+                self.clearTransfer(id)
                 self.mutate(id) { $0.state = .failed; $0.error = msg }
                 self.advance()
             }
@@ -542,10 +610,11 @@ extension DownloadManager: URLSessionDownloadDelegate {
         guard let error, let d = Self.parseDesc(task.taskDescription) else { return }
         let id = d.id
         let ns = error as NSError
-        if ns.code == NSURLErrorCancelled { return } // pause/remove handle their own state
+        if ns.code == NSURLErrorCancelled { return } // pause/delete handle their own state
         let data = ns.userInfo[NSURLSessionDownloadTaskResumeData] as? Data
         let msg = error.localizedDescription
         Task { @MainActor in
+            self.clearTransfer(id)
             self.mutate(id) { $0.state = .failed; $0.error = msg; $0.resumeData = data }
             self.advance()
         }

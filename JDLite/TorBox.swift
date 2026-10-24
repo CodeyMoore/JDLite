@@ -5,6 +5,7 @@ import Combine
 struct TorBoxFile {
     var id: Int
     var name: String
+    var size: Int64?
 }
 
 struct TorBoxWebDownload {
@@ -13,6 +14,12 @@ struct TorBoxWebDownload {
     var progress: Double?
     var state: String
     var files: [TorBoxFile]
+
+    /// How far TorBox has fetched the file, 0...1 (nil until it reports progress).
+    var fraction: Double? {
+        guard let p = progress, p > 0 else { return nil }
+        return min(p <= 1 ? p : p / 100, 1)
+    }
 
     var statusText: String {
         if let p = progress, p > 0 {
@@ -187,7 +194,8 @@ final class TorBox: ObservableObject {
             let short = (f["short_name"] as? String) ?? ""
             let full = (f["name"] as? String) ?? ""
             let name = short.isEmpty ? (full as NSString).lastPathComponent : short
-            return TorBoxFile(id: fileId, name: name.isEmpty ? "file-\(fileId)" : name)
+            return TorBoxFile(id: fileId, name: name.isEmpty ? "file-\(fileId)" : name,
+                              size: Self.int64(f["size"]))
         }
 
         var failure: String?
@@ -294,6 +302,12 @@ final class TorBox: ObservableObject {
     private static func int(_ v: Any?) -> Int? {
         if let n = v as? NSNumber { return n.intValue }
         if let s = v as? String { return Int(s) }
+        return nil
+    }
+
+    private static func int64(_ v: Any?) -> Int64? {
+        if let n = v as? NSNumber { return n.int64Value }
+        if let s = v as? String { return Int64(s) }
         return nil
     }
 
