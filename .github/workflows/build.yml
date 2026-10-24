@@ -17,16 +17,20 @@ jobs:
         run: |
           xcodebuild -project JDLite.xcodeproj -scheme JDLite \
             -configuration Release -sdk iphoneos -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build
 
       - name: Package IPA
         run: |
+          OUT=build/Build/Products/Release-iphoneos
+          test -d "$OUT/JDLite.app"
+          test -d "$OUT/JDLiteExtension.appex"
+          mkdir -p "$OUT/JDLite.app/PlugIns"
+          cp -R "$OUT/JDLiteExtension.appex" "$OUT/JDLite.app/PlugIns/"
           mkdir Payload
-          cp -R build/Build/Products/Release-iphoneos/JDLite.app Payload/
+          cp -R "$OUT/JDLite.app" Payload/
           zip -qry JDLite.ipa Payload
-          unzip -l JDLite.ipa | head -n 20
+          unzip -l JDLite.ipa | grep -E "Info.plist|\.appex/" | head -n 10
 
       - uses: actions/upload-artifact@v4
         with:
