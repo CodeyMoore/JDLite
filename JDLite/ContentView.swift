@@ -3,7 +3,7 @@ import UIKit
 
 struct ContentView: View {
     enum Sheet: Identifiable {
-        case add, torbox, plugins
+        case add, torbox, plugins, settings
         var id: Self { self }
     }
 
@@ -62,6 +62,7 @@ struct ContentView: View {
                 case .add: AddLinksView()
                 case .torbox: TorBoxView()
                 case .plugins: PluginsView()
+                case .settings: SettingsView()
                 }
             }
             .task { await PluginHost.shared.ensureLoaded() }
@@ -97,6 +98,7 @@ struct ContentView: View {
                 Menu {
                     Button("TorBox", systemImage: "cloud") { sheet = .torbox }
                     Button("Plugins", systemImage: "puzzlepiece.extension") { sheet = .plugins }
+                    Button("Settings", systemImage: "gearshape") { sheet = .settings }
                     Divider()
                     Button("Select Downloads", systemImage: "checkmark.circle") { editMode = .active }
                         .disabled(manager.items.isEmpty)
@@ -227,6 +229,7 @@ struct DownloadRow: View {
         case .resolving:
             return item.status ?? "Resolving…"
         case .downloading:
+            if let status = item.status { return status }   // "Connecting…", "Joining parts…"
             var parts: [String] = []
             if item.bytesTotal > 0 {
                 parts.append(percent)
@@ -344,6 +347,9 @@ struct DownloadDetails: View {
                 : Fmt.bytes(item.bytesReceived)))
         }
         r.append(DetailRow("File size", item.bytesTotal > 0 ? Fmt.bytes(item.bytesTotal) : "Unknown yet"))
+        if item.state != .completed, let segs = item.segments {
+            r.append(DetailRow("Connections", "\(segs.count) (\(segs.filter { $0.done }.count) parts done)"))
+        }
         if item.state == .resolving, let p = item.cloudProgress {
             r.append(DetailRow("TorBox", "\(Int(p * 100))% fetched"))
         }

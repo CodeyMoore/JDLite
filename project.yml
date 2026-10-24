@@ -14,9 +14,13 @@ targets:
       # case, so it would clash with the app's "PlugIns" extension folder.
       - path: JDLite/BuiltInPlugins
         type: folder
+      - path: Shared
     dependencies:
+      # CI copies both extensions into the app by hand (see build.yml).
       - target: JDLiteExtension
-        embed: false   # CI copies the .appex into the app by hand (see build.yml)
+        embed: false
+      - target: JDLiteWidgets
+        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.codeymoore.jdlite
@@ -27,11 +31,12 @@ targets:
       path: JDLite/Info.plist
       properties:
         CFBundleDisplayName: JDLite
-        CFBundleShortVersionString: "1.2"
-        CFBundleVersion: "3"
+        CFBundleShortVersionString: "1.3"
+        CFBundleVersion: "4"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        NSSupportsLiveActivities: true
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         CFBundleURLTypes:
@@ -48,7 +53,7 @@ targets:
         buildPhase: resources
     settings:
       base:
-        # Must stay the app's bundle ID + ".extension"
+        # Extension IDs must start with the app's bundle ID.
         PRODUCT_BUNDLE_IDENTIFIER: com.codeymoore.jdlite.extension
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -56,8 +61,28 @@ targets:
       path: JDLiteExtension/Info.plist
       properties:
         CFBundleDisplayName: JDLite
-        CFBundleShortVersionString: "1.2"
-        CFBundleVersion: "3"
+        CFBundleShortVersionString: "1.3"
+        CFBundleVersion: "4"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.Safari.web-extension
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SafariWebExtensionHandler
+  JDLiteWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: JDLiteWidgets/JDLiteWidgets.swift
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codeymoore.jdlite.widgets
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+    info:
+      path: JDLiteWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: JDLite
+        CFBundleShortVersionString: "1.3"
+        CFBundleVersion: "4"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
