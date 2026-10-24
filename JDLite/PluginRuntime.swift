@@ -7,7 +7,6 @@ struct PluginInfo: Identifiable, Codable, Hashable {
     var version: String
     var hosts: [String]
     var pattern: String?
-    var accounts: Bool
     var file: String
 }
 
@@ -213,7 +212,7 @@ final class JSRuntime {
         return (infos, errors)
     }
 
-    func resolve(pluginId: String, url: String, accountJSON: String?) async throws -> String {
+    func resolve(pluginId: String, url: String) async throws -> String {
         try await withCheckedThrowingContinuation { cont in
             queue.async {
                 guard let ctx = self.context, let fn = ctx.objectForKeyedSubscript("__resolve") else {
@@ -237,8 +236,7 @@ final class JSRuntime {
                     self.http.dropJar(callId)
                     cont.resume(throwing: PluginError.message("Plugin timed out after 60 s"))
                 }
-                let acct: Any = accountJSON.map { $0 as Any } ?? NSNull()
-                _ = fn.call(withArguments: [pluginId, callId, url, acct,
+                _ = fn.call(withArguments: [pluginId, callId, url,
                                             unsafeBitCast(cb, to: AnyObject.self)])
             }
         }
@@ -264,7 +262,7 @@ function __meta() {
     return {
       id: String(p.id), name: String(p.name || p.id), version: String(p.version || ""),
       hosts: (p.hosts || []).map(String), pattern: p.pattern ? String(p.pattern) : null,
-      accounts: !!p.accounts, file: p.__file
+      file: p.__file
     };
   }));
 }
@@ -330,12 +328,11 @@ function __makeHttp(callId) {
   };
 }
 
-function __resolve(id, callId, url, accountJSON, cb) {
+function __resolve(id, callId, url, cb) {
   var p = __plugins[id];
   if (!p) { cb("Plugin not found: " + id, null); return; }
   var ctx = {
     http: __makeHttp(callId),
-    account: accountJSON ? JSON.parse(accountJSON) : null,
     log: function () {
       var parts = Array.prototype.slice.call(arguments).map(function (x) {
         return typeof x === "string" ? x : JSON.stringify(x);

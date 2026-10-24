@@ -2,7 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     enum Sheet: Identifiable {
-        case add, accounts, plugins
+        case add, torbox, plugins
         var id: Self { self }
     }
 
@@ -32,7 +32,7 @@ struct ContentView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Menu {
-                        Button("Accounts", systemImage: "person.crop.circle") { sheet = .accounts }
+                        Button("TorBox", systemImage: "cloud") { sheet = .torbox }
                         Button("Plugins", systemImage: "puzzlepiece.extension") { sheet = .plugins }
                         Divider()
                         Button("Clear completed", systemImage: "checkmark.circle") { manager.clearCompleted() }
@@ -45,7 +45,7 @@ struct ContentView: View {
             .sheet(item: $sheet) { s in
                 switch s {
                 case .add: AddLinksView()
-                case .accounts: AccountsView()
+                case .torbox: TorBoxView()
                 case .plugins: PluginsView()
                 }
             }
@@ -65,12 +65,10 @@ struct DownloadRow: View {
                 if item.state == .downloading || item.state == .paused {
                     ProgressView(value: item.progress)
                 }
-                Text(statusText).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                Text(statusText).font(.caption).foregroundStyle(.secondary).lineLimit(3)
             }
             Spacer()
-            if item.state == .resolving {
-                ProgressView()
-            } else if let symbol = actionSymbol {
+            if let symbol = actionSymbol {
                 Button { act() } label: { Image(systemName: symbol).font(.title3) }
                     .buttonStyle(.borderless)
             }
@@ -82,11 +80,15 @@ struct DownloadRow: View {
     }
 
     private var statusText: String {
+        let via = item.torboxId != nil ? " · TorBox" : ""
         switch item.state {
-        case .queued: return "Queued"
-        case .resolving: return "Resolving…"
+        case .queued: return "Queued" + via
+        case .resolving: return item.status ?? "Resolving…"
         case .downloading:
-            return item.bytesTotal > 0 ? "\(fmt(item.bytesReceived)) / \(fmt(item.bytesTotal))" : fmt(item.bytesReceived)
+            let amount = item.bytesTotal > 0
+                ? "\(fmt(item.bytesReceived)) / \(fmt(item.bytesTotal))"
+                : fmt(item.bytesReceived)
+            return amount + via
         case .paused: return "Paused"
         case .completed: return "Done · \(fmt(item.bytesTotal))"
         case .failed: return item.error ?? "Failed"
@@ -95,7 +97,7 @@ struct DownloadRow: View {
 
     private var actionSymbol: String? {
         switch item.state {
-        case .downloading: return "pause.circle"
+        case .downloading, .resolving: return "pause.circle"
         case .paused: return "play.circle"
         case .failed: return "arrow.clockwise.circle"
         default: return nil
@@ -104,7 +106,7 @@ struct DownloadRow: View {
 
     private func act() {
         switch item.state {
-        case .downloading: manager.pause(item.id)
+        case .downloading, .resolving: manager.pause(item.id)
         case .paused, .failed: manager.resume(item.id)
         default: break
         }

@@ -24,6 +24,8 @@ targets:
       path: JDLite/Info.plist
       properties:
         CFBundleDisplayName: JDLite
+        CFBundleShortVersionString: "1.1"
+        CFBundleVersion: "2"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
@@ -36,12 +38,14 @@ targets:
     type: app-extension
     platform: iOS
     sources:
-      - path: JDLiteExtension
-        excludes: ["Resources/**", "Info.plist"]
+      - path: JDLiteExtension/SafariWebExtensionHandler.swift
+      # Added as individual files (not a folder reference): Safari only loads
+      # the extension if manifest.json is at the top level of the .appex.
       - path: JDLiteExtension/Resources
-        type: folder
+        buildPhase: resources
     settings:
       base:
+        # Must stay the app's bundle ID + ".extension"
         PRODUCT_BUNDLE_IDENTIFIER: com.example.jdlite.extension
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -49,6 +53,8 @@ targets:
       path: JDLiteExtension/Info.plist
       properties:
         CFBundleDisplayName: JDLite
+        CFBundleShortVersionString: "1.1"
+        CFBundleVersion: "2"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.Safari.web-extension
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SafariWebExtensionHandler

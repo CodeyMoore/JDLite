@@ -13,7 +13,7 @@ struct PluginsView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(p.version.isEmpty ? p.name : "\(p.name) \(p.version)")
                             Text(p.hosts.joined(separator: ", ")).font(.caption).foregroundStyle(.secondary)
-                            Text(p.file + (p.accounts ? " · uses accounts" : ""))
+                            Text(p.file)
                                 .font(.caption2).foregroundStyle(.tertiary)
                         }
                     }
@@ -33,7 +33,7 @@ struct PluginsView: View {
                 } header: {
                     Text("Log")
                 } footer: {
-                    Text("Add .js files in Files › On My iPhone › JDLite › Plugins, then tap Reload. Only install plugins you trust: they can make network requests and receive the accounts for their site.")
+                    Text("Add .js files in Files › On My iPhone › JDLite › Plugins, then tap Reload. Only install plugins you trust: they can make network requests. Built-in plugins are restored on launch, so copy one under a new name to change it.")
                 }
             }
             .navigationTitle("Plugins")

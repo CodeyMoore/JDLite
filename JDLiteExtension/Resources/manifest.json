@@ -1,12 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "JDLite Link Grabber",
-  "version": "1.0",
-  "description": "Find downloadable links on a page and send them to JDLite.",
+  "name": "JDLite",
+  "version": "1.1",
+  "description": "Send the links on a page to JDLite.",
   "action": { "default_popup": "popup.html", "default_title": "JDLite" },
-  "content_scripts": [
-    { "matches": ["<all_urls>"], "js": ["content.js"], "run_at": "document_idle" }
-  ],
-  "permissions": ["activeTab", "tabs"],
-  "host_permissions": ["<all_urls>"]
+  "permissions": ["activeTab", "scripting"]
 }

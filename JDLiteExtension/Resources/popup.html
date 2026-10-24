@@ -9,13 +9,14 @@
   <header>
     <input id="q" type="search" placeholder="Filter links">
     <div id="chips">
+      <button data-filter="hosters">Hosters</button>
       <button data-filter="files">Files</button>
       <button data-filter="media">Media</button>
       <button data-filter="images">Images</button>
       <button data-filter="all">All</button>
     </div>
   </header>
-  <p id="status"></p>
+  <p id="status">Reading page…</p>
   <ul id="list"></ul>
   <footer>
     <div class="row">
@@ -26,7 +27,7 @@
       <a id="send" class="btn primary disabled" href="#">Send to JDLite</a>
       <button id="copy">Copy</button>
     </div>
-    <a id="page" class="link" href="#">Send this page's URL</a>
+    <a id="page" class="link" href="#" hidden>Send this page's URL</a>
   </footer>
   <script src="popup.js"></script>
 </body>

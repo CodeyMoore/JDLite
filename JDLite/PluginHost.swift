@@ -48,13 +48,8 @@ final class PluginHost: ObservableObject {
         }
     }
 
-    func resolve(plugin: PluginInfo, url: URL, account: Account?) async throws -> [ResolvedLink] {
-        var accountJSON: String?
-        if let a = account {
-            let dict = ["label": a.label, "username": a.username, "password": a.password, "cookies": a.cookies]
-            accountJSON = (try? JSONSerialization.data(withJSONObject: dict)).flatMap { String(data: $0, encoding: .utf8) }
-        }
-        let json = try await runtime.resolve(pluginId: plugin.id, url: url.absoluteString, accountJSON: accountJSON)
+    func resolve(plugin: PluginInfo, url: URL) async throws -> [ResolvedLink] {
+        let json = try await runtime.resolve(pluginId: plugin.id, url: url.absoluteString)
         let data = Data(json.utf8)
         let dec = JSONDecoder()
         var links: [ResolvedLink]
@@ -76,9 +71,12 @@ final class PluginHost: ObservableObject {
         try? fm.createDirectory(at: Self.pluginsDir, withIntermediateDirectories: true)
         guard let src = Bundle.main.url(forResource: "Plugins", withExtension: nil),
               let files = try? fm.contentsOfDirectory(at: src, includingPropertiesForKeys: nil) else { return }
+        // Built-in plugins are refreshed on every launch; to customise one,
+        // copy it under a different file name.
         for f in files {
             let dest = Self.pluginsDir.appendingPathComponent(f.lastPathComponent)
-            if !fm.fileExists(atPath: dest.path) { try? fm.copyItem(at: f, to: dest) }
+            try? fm.removeItem(at: dest)
+            try? fm.copyItem(at: f, to: dest)
         }
     }
 

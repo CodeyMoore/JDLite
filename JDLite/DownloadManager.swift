@@ -13,8 +13,12 @@ struct DownloadItem: Identifiable, Codable {
     var resumeData: Data?
     var error: String?
     var headers: [String: String]?   // from a plugin, sent with the download
-    var needsResolve: Bool?          // true until plugins have had a look at the URL
-    var preferredName: String?       // file name chosen by a plugin
+    var needsResolve: Bool?          // true until plugins/TorBox have looked at the link
+    var preferredName: String?       // file name chosen by a plugin or TorBox
+    var status: String?              // progress note while resolving
+    var sourceURL: URL?              // the link as it was added
+    var torboxId: Int?               // TorBox web download ID
+    var torboxFileId: Int?           // file inside that TorBox download
     var progress: Double { bytesTotal > 0 ? Double(bytesReceived) / Double(bytesTotal) : 0 }
 }
 
@@ -27,6 +31,7 @@ final class DownloadManager: NSObject, ObservableObject {
     var backgroundCompletionHandler: (() -> Void)?
 
     private var session: URLSession!
+    private var torboxPoller: Task<Void, Never>?
     private let storeURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -49,13 +54,13 @@ final class DownloadManager: NSObject, ObservableObject {
 
     func add(urls: [URL]) {
         var ids: [UUID] = []
-        for url in urls where !items.contains(where: { $0.url == url && $0.state != .completed }) {
+        for url in urls where !items.contains(where: { ($0.sourceURL ?? $0.url) == url && $0.state != .completed }) {
             var name = url.lastPathComponent
             if name.isEmpty || name == "/" { name = url.host ?? "download" }
-            let item = DownloadItem(url: url,
-                                    fileName: name.replacingOccurrences(of: "/", with: "_"),
-                                    state: .resolving,
-                                    needsResolve: true)
+            var item = DownloadItem(url: url, fileName: name.replacingOccurrences(of: "/", with: "_"))
+            item.state = .resolving
+            item.needsResolve = true
+            item.sourceURL = url
             items.append(item)
             ids.append(item.id)
         }
@@ -87,17 +92,23 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     func pause(_ id: UUID) {
-        guard let item = items.first(where: { $0.id == id }), item.state != .resolving else { return }
-        if item.state == .queued { mutate(id) { $0.state = .paused }; return }
-        let key = id.uuidString
-        session.getTasksWithCompletionHandler { _, _, downloads in
-            guard let t = downloads.first(where: { $0.taskDescription?.hasPrefix(key) == true }) else { return }
-            t.cancel(byProducingResumeData: { data in
-                Task { @MainActor in
-                    self.mutate(id) { $0.resumeData = data; $0.state = .paused }
-                    self.startNext()
-                }
-            })
+        guard let item = items.first(where: { $0.id == id }) else { return }
+        switch item.state {
+        case .queued, .resolving:
+            mutate(id) { $0.state = .paused; $0.status = nil }
+        case .downloading:
+            let key = id.uuidString
+            session.getTasksWithCompletionHandler { _, _, downloads in
+                guard let t = downloads.first(where: { $0.taskDescription?.hasPrefix(key) == true }) else { return }
+                t.cancel(byProducingResumeData: { data in
+                    Task { @MainActor in
+                        self.mutate(id) { $0.resumeData = data; $0.state = .paused }
+                        self.startNext()
+                    }
+                })
+            }
+        default:
+            break
         }
     }
 
@@ -128,42 +139,171 @@ final class DownloadManager: NSObject, ObservableObject {
         return out
     }
 
-    // MARK: Plugin resolving
+    // MARK: Resolving: plugins first, then TorBox, otherwise download the link directly
 
     private func runResolve(_ id: UUID) async {
-        guard let item = items.first(where: { $0.id == id }) else { return }
-        await PluginHost.shared.ensureLoaded()
+        guard let item = items.first(where: { $0.id == id }), item.state == .resolving else { return }
+        let link = item.sourceURL ?? item.url
 
-        guard let plugin = PluginHost.shared.match(item.url) else {
-            mutate(id) { $0.state = .queued; $0.needsResolve = nil }
-            startNext()
+        // Already handed to TorBox (e.g. the app was closed while TorBox fetched it).
+        if item.torboxId != nil {
+            if item.torboxFileId != nil {
+                mutate(id) { $0.state = .queued; $0.needsResolve = nil; $0.status = nil }
+                startNext()
+            } else {
+                setStatus(id, "Waiting for TorBox…")
+                startTorBoxPolling()
+            }
             return
         }
-        let account = AccountStore.shared.account(for: item.url, plugin: plugin)
-        do {
-            let links = try await PluginHost.shared.resolve(plugin: plugin, url: item.url, account: account)
-            guard items.contains(where: { $0.id == id }) else { return } // removed while resolving
-            let first = links[0]
-            mutate(id) {
-                $0.url = first.url
-                $0.fileName = first.fileName ?? first.url.lastPathComponent
-                $0.preferredName = first.fileName
-                $0.headers = first.headers
-                $0.state = .queued
-                $0.needsResolve = nil
-                $0.error = nil
+
+        await PluginHost.shared.ensureLoaded()
+        if let plugin = PluginHost.shared.match(link) {
+            setStatus(id, "Resolving with \(plugin.name)…")
+            do {
+                let links = try await PluginHost.shared.resolve(plugin: plugin, url: link)
+                guard isResolving(id) else { return }
+                applyResolved(id, links)
+            } catch {
+                failResolve(id, error.localizedDescription)
             }
-            for link in links.dropFirst() {
-                items.append(DownloadItem(url: link.url,
-                                          fileName: link.fileName ?? link.url.lastPathComponent,
-                                          headers: link.headers,
-                                          preferredName: link.fileName))
-            }
-            save()
-            startNext()
-        } catch {
-            mutate(id) { $0.state = .failed; $0.error = error.localizedDescription }
+            return
         }
+
+        if await TorBox.shared.supports(link) {
+            guard isResolving(id) else { return }
+            setStatus(id, "Sending to TorBox…")
+            do {
+                let webId = try await TorBox.shared.create(link: link)
+                guard items.contains(where: { $0.id == id }) else { return }
+                mutate(id) { $0.torboxId = webId }
+                guard isResolving(id) else { return }
+                setStatus(id, "Waiting for TorBox…")
+                startTorBoxPolling()
+            } catch {
+                failResolve(id, "TorBox: " + error.localizedDescription)
+            }
+            return
+        }
+
+        guard isResolving(id) else { return }
+        mutate(id) { $0.state = .queued; $0.needsResolve = nil; $0.status = nil }
+        startNext()
+    }
+
+    private func applyResolved(_ id: UUID, _ links: [ResolvedLink]) {
+        guard let first = links.first, let item = items.first(where: { $0.id == id }) else { return }
+        let origin = item.sourceURL ?? item.url
+        mutate(id, persist: false) {
+            $0.url = first.url
+            $0.fileName = first.fileName ?? first.url.lastPathComponent
+            $0.preferredName = first.fileName
+            $0.headers = first.headers
+            $0.sourceURL = origin
+            $0.state = .queued
+            $0.needsResolve = nil
+            $0.status = nil
+            $0.error = nil
+        }
+        for link in links.dropFirst() {
+            var extra = DownloadItem(url: link.url, fileName: link.fileName ?? link.url.lastPathComponent)
+            extra.headers = link.headers
+            extra.preferredName = link.fileName
+            extra.sourceURL = origin
+            items.append(extra)
+        }
+        save()
+        startNext()
+    }
+
+    // MARK: TorBox
+
+    /// One loop checks every link TorBox is still fetching, so API use stays low.
+    private func startTorBoxPolling() {
+        guard torboxPoller == nil else { return }
+        torboxPoller = Task {
+            await self.pollTorBox()
+            self.torboxPoller = nil
+        }
+    }
+
+    private func pollTorBox() async {
+        var delay: Double = 2
+        var strikes: [UUID: Int] = [:]
+        while true {
+            let waiting = items.filter { $0.state == .resolving && $0.torboxId != nil && $0.torboxFileId == nil }
+            if waiting.isEmpty { return }
+            for item in waiting {
+                guard let webId = item.torboxId, isResolving(item.id) else { continue }
+                do {
+                    let dl = try await TorBox.shared.webDownload(id: webId)
+                    strikes[item.id] = nil
+                    guard isResolving(item.id) else { continue }
+                    if let failure = dl.failure {
+                        mutate(item.id) { $0.torboxId = nil }   // retry adds the link to TorBox again
+                        failResolve(item.id, "TorBox: " + failure)
+                    } else if dl.ready {
+                        torboxReady(item.id, webId: webId, files: dl.files)
+                    } else {
+                        setStatus(item.id, dl.statusText)
+                    }
+                } catch TorBoxError.gone {
+                    mutate(item.id) { $0.torboxId = nil }
+                    failResolve(item.id, "TorBox: " + (TorBoxError.gone.errorDescription ?? "download gone"))
+                } catch is URLError {
+                    let n = (strikes[item.id] ?? 0) + 1
+                    strikes[item.id] = n
+                    if n >= 6 {
+                        failResolve(item.id, "TorBox: can't connect. Tap retry.")
+                    } else {
+                        setStatus(item.id, "TorBox: connection problem, retrying…")
+                    }
+                } catch {
+                    failResolve(item.id, "TorBox: " + error.localizedDescription)
+                }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            delay = min(delay * 1.5, 10)
+        }
+    }
+
+    private func torboxReady(_ id: UUID, webId: Int, files: [TorBoxFile]) {
+        guard let first = files.first, let item = items.first(where: { $0.id == id }) else { return }
+        let origin = item.sourceURL ?? item.url
+        mutate(id, persist: false) {
+            $0.torboxFileId = first.id
+            $0.fileName = first.name
+            $0.preferredName = first.name
+            $0.sourceURL = origin
+            $0.state = .queued
+            $0.needsResolve = nil
+            $0.status = nil
+            $0.error = nil
+        }
+        for file in files.dropFirst() {
+            var extra = DownloadItem(url: origin, fileName: file.name)
+            extra.preferredName = file.name
+            extra.sourceURL = origin
+            extra.torboxId = webId
+            extra.torboxFileId = file.id
+            items.append(extra)
+        }
+        save()
+        startNext()
+    }
+
+    private func isResolving(_ id: UUID) -> Bool {
+        items.first(where: { $0.id == id })?.state == .resolving
+    }
+
+    private func setStatus(_ id: UUID, _ text: String) {
+        mutate(id, persist: false) { $0.status = text }
+    }
+
+    private func failResolve(_ id: UUID, _ message: String) {
+        guard isResolving(id) else { return }   // paused or removed meanwhile
+        mutate(id) { $0.state = .failed; $0.error = message; $0.status = nil }
     }
 
     // MARK: Queue
@@ -171,18 +311,28 @@ final class DownloadManager: NSObject, ObservableObject {
     private func startNext() {
         var active = items.filter { $0.state == .downloading }.count
         for i in items.indices where active < maxConcurrent && items[i].state == .queued {
-            begin(at: i)
-            active += 1
+            if begin(at: i) { active += 1 }
         }
     }
 
-    private func begin(at i: Int) {
+    @discardableResult
+    private func begin(at i: Int) -> Bool {
         let item = items[i]
         let task: URLSessionDownloadTask
         if let data = item.resumeData {
             task = session.downloadTask(withResumeData: data)
         } else {
-            var req = URLRequest(url: item.url)
+            var target = item.url
+            if let webId = item.torboxId, let fileId = item.torboxFileId {
+                guard let link = TorBox.shared.permalink(webId: webId, fileId: fileId) else {
+                    items[i].state = .failed
+                    items[i].error = TorBoxError.noKey.errorDescription
+                    save()
+                    return false
+                }
+                target = link
+            }
+            var req = URLRequest(url: target)
             for (k, v) in item.headers ?? [:] { req.setValue(v, forHTTPHeaderField: k) }
             task = session.downloadTask(with: req)
         }
@@ -193,7 +343,9 @@ final class DownloadManager: NSObject, ObservableObject {
         items[i].state = .downloading
         items[i].resumeData = nil
         items[i].error = nil
+        items[i].status = nil
         save()
+        return true
     }
 
     private func reconcile() {
@@ -225,6 +377,42 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     fileprivate func advance() { startNext() }
+
+    fileprivate func downloadFailed(_ id: UUID, message: String) {
+        mutate(id) {
+            $0.state = .failed
+            $0.error = message
+            $0.resumeData = nil
+            // Links found by a plugin can expire, so look the page up again on retry.
+            // (TorBox items always start from a fresh TorBox link anyway.)
+            if $0.torboxFileId == nil, let source = $0.sourceURL, source != $0.url {
+                $0.needsResolve = true
+            }
+        }
+        startNext()
+    }
+
+    fileprivate func gotWebPage(_ id: UUID) {
+        let hint: String
+        if TorBox.shared.isActive {
+            hint = "TorBox doesn't list this site as supported."
+        } else if TorBox.shared.hasKey {
+            hint = "TorBox is switched off in ⋯ › TorBox."
+        } else {
+            hint = "For file hosters like this one, add your TorBox API key in ⋯ › TorBox, then tap retry."
+        }
+        mutate(id) {
+            $0.state = .failed
+            $0.resumeData = nil
+            $0.error = "Got a web page instead of a file. " + hint
+            if $0.torboxFileId == nil {
+                if let source = $0.sourceURL { $0.url = source }
+                $0.headers = nil
+                $0.needsResolve = true   // retry checks TorBox/plugins again
+            }
+        }
+        startNext()
+    }
 
     // MARK: Persistence
 
@@ -265,6 +453,19 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         return candidate
     }
+
+    /// Reads a small JSON body (error replies are small; real files are skipped).
+    nonisolated static func smallJSON(at url: URL) -> [String: Any]? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        guard size > 0, size < 65_536, let data = try? Data(contentsOf: url) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    nonisolated static func message(in json: [String: Any]) -> String? {
+        let text = (json["detail"] as? String) ?? (json["error"] as? String) ?? ""
+        return text.isEmpty ? nil : text
+    }
 }
 
 // MARK: - URLSession delegate (runs off the main actor)
@@ -290,10 +491,22 @@ extension DownloadManager: URLSessionDownloadDelegate {
 
         if let http = downloadTask.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let code = http.statusCode
-            Task { @MainActor in
-                self.mutate(id) { $0.state = .failed; $0.error = "HTTP \(code)" }
-                self.advance()
-            }
+            let detail = Self.smallJSON(at: location).flatMap { Self.message(in: $0) }
+            let message = detail.map { "HTTP \(code): \($0)" } ?? "HTTP \(code)"
+            Task { @MainActor in self.downloadFailed(id, message: message) }
+            return
+        }
+
+        // A web page instead of a file (e.g. a file hoster's download page): don't save it.
+        let mime = downloadTask.response?.mimeType?.lowercased() ?? ""
+        if mime == "text/html" || mime == "application/xhtml+xml" {
+            Task { @MainActor in self.gotWebPage(id) }
+            return
+        }
+        if mime == "application/json", let json = Self.smallJSON(at: location),
+           (json["success"] as? Bool) == false {
+            let message = Self.message(in: json) ?? "The server returned an error."
+            Task { @MainActor in self.downloadFailed(id, message: message) }
             return
         }
 

@@ -1,5 +1,8 @@
 /*
-  JDLite plugin template. Copy this file, then change `id`, `hosts` and `resolve`.
+  JDLite plugin template. Copy this file under a new name, then change `id`,
+  `hosts` and `resolve`. (Built-in plugin files are restored on every launch.)
+
+  Plugins run before TorBox: if a plugin matches a link, TorBox isn't used for it.
 
   registerPlugin({
     id:       unique string
@@ -7,7 +10,6 @@
     version:  optional
     hosts:    ["example.com"]   matches the host and its subdomains
     pattern:  optional regex (string) tested against the full URL
-    accounts: true if resolve() uses ctx.account (the matching account is passed in)
     async resolve(url, ctx) -> link | [links]
   })
 
@@ -19,7 +21,6 @@
   ctx.http.request({method, url, headers, body, follow})
       -> Promise<{ status, headers (lowercase keys), body (string), url (final) }>
   ctx.http.cookieHeader(url)  Cookie header built from cookies set during this resolve
-  ctx.account                 { label, username, password, cookies } or null
   ctx.absURL(rel, base)       resolve a relative URL (there is no global URL class)
   ctx.decodeHTML(str)         &amp; &quot; ... -> characters
   ctx.log(...), ctx.sleep(ms)
@@ -27,7 +28,7 @@
 registerPlugin({
   id: "example-template",
   name: "Example template",
-  version: "1.0",
+  version: "1.1",
   hosts: ["example.invalid"],
   async resolve(url, ctx) {
     const r = await ctx.http.get(url);

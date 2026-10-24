@@ -17,3 +17,4 @@ footer { padding-top: 8px; }
 .btn.primary { flex: 1; background: AccentColor; color: AccentColorText; border-color: AccentColor; }
 .btn.disabled { opacity: .4; pointer-events: none; }
 .link { display: block; text-align: center; color: AccentColor; font-size: 13px; }
+.link[hidden] { display: none; }
