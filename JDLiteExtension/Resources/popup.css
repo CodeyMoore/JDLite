@@ -23,3 +23,8 @@ footer { padding-top: 10px; }
 #count { color: GrayText; font-size: 13px; }
 .link { display: block; text-align: center; color: var(--brand); font-size: 13px; padding: 4px; }
 .link[hidden] { display: none; }
+details { margin-top: 10px; }
+details summary { cursor: pointer; padding: 8px 2px; color: var(--brand); font-weight: 600; font-size: 14px; }
+details .note { color: GrayText; font-size: 12px; line-height: 1.4; margin: 0 2px 6px; }
+#moreList { max-height: 32vh; }
+#toggle[hidden] { display: none; }

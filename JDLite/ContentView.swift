@@ -350,7 +350,7 @@ struct DownloadRow: View {
                 }
             }
             if expanded && !editing {
-                DownloadDetails(item: item, speed: speed)
+                DownloadDetails(item: item, speed: speed, connections: manager.connectionCounts[item.id])
                     .transition(.opacity)
             }
         }
@@ -388,7 +388,7 @@ struct DownloadRow: View {
         case .resolving:
             return item.status ?? "Resolving…"
         case .downloading:
-            if let status = item.status { return status }   // "Connecting…", "Joining parts…"
+            if let status = item.status { return status }   // "Connecting…", "Waiting for TorBox…"
             var parts: [String] = []
             if item.bytesTotal > 0 {
                 parts.append(percent)
@@ -438,6 +438,7 @@ struct DownloadRow: View {
 struct DownloadDetails: View {
     let item: DownloadItem
     let speed: Double?
+    var connections: Int?
 
     private struct DetailRow: Identifiable {
         let label: String
@@ -506,8 +507,8 @@ struct DownloadDetails: View {
                 : Fmt.bytes(item.bytesReceived)))
         }
         r.append(DetailRow("File size", item.bytesTotal > 0 ? Fmt.bytes(item.bytesTotal) : "Unknown yet"))
-        if item.state != .completed, let segs = item.segments {
-            r.append(DetailRow("Connections", "\(segs.count) (\(segs.filter { $0.done }.count) parts done)"))
+        if item.state == .downloading, let connections, connections > 0 {
+            r.append(DetailRow("Connections", "\(connections)"))
         }
         if item.state == .resolving, let p = item.cloudProgress {
             r.append(DetailRow("TorBox", "\(Int(p * 100))% fetched"))

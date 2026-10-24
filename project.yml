@@ -31,12 +31,14 @@ targets:
       path: JDLite/Info.plist
       properties:
         CFBundleDisplayName: JDLite
-        CFBundleShortVersionString: "1.4"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "1.5"
+        CFBundleVersion: "6"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         NSSupportsLiveActivities: true
+        # Lets "Full Speed in Background" keep JDLite awake while it downloads.
+        UIBackgroundModes: [audio]
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         CFBundleURLTypes:
@@ -61,8 +63,11 @@ targets:
       path: JDLiteExtension/Info.plist
       properties:
         CFBundleDisplayName: JDLite
-        CFBundleShortVersionString: "1.4"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "1.5"
+        CFBundleVersion: "6"
+        # The extension checks links on any site (some still use plain http).
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
         NSExtension:
           NSExtensionPointIdentifier: com.apple.Safari.web-extension
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SafariWebExtensionHandler
@@ -82,7 +87,7 @@ targets:
       path: JDLiteWidgets/Info.plist
       properties:
         CFBundleDisplayName: JDLite
-        CFBundleShortVersionString: "1.4"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "1.5"
+        CFBundleVersion: "6"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension

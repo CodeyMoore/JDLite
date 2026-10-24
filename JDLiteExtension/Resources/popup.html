@@ -12,10 +12,15 @@
       <strong>JDLite</strong>
       <span id="summary" class="summary"></span>
     </div>
-    <input id="q" type="search" placeholder="Filter files" hidden>
+    <input id="q" type="search" placeholder="Filter" hidden>
   </header>
   <p id="message">Looking for download files…</p>
   <ul id="list"></ul>
+  <details id="more" hidden>
+    <summary id="moreTitle">Other download links</summary>
+    <p class="note">These look like download buttons or file-host links, but JDLite can't tell which file they lead to. Tick any you want: file-host links download through TorBox.</p>
+    <ul id="moreList"></ul>
+  </details>
   <footer id="actions" hidden>
     <div class="row">
       <button id="toggle">Select none</button>

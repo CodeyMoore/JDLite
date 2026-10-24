@@ -4,16 +4,34 @@ import UIKit
 
 enum DownloadState: String, Codable { case queued, resolving, downloading, paused, completed, failed }
 
-/// One byte range of a file, downloaded over its own connection.
+/// One byte range of a file. In-app connections write it straight into the download's data
+/// file; a background (iOS) transfer fetches it into a file of its own, which is copied into
+/// place when it arrives.
 struct Segment: Codable, Equatable {
     var start: Int64
     var end: Int64                   // inclusive
-    var received: Int64 = 0
-    var done = false
+    var received: Int64 = 0          // bytes fetched so far
+    var done = false                 // saved in the data file
     var retries = 0
     var resumeData: Data?
+    var background: Bool?            // being fetched by a background transfer
 
     var length: Int64 { end - start + 1 }
+}
+
+/// What a quick look at a file's first byte says about the server.
+struct Probe: Sendable {
+    let total: Int64
+    let acceptsRanges: Bool
+}
+
+/// What a background transfer's description says about it.
+struct TransferTag: Sendable {
+    let id: UUID
+    let name: String?
+    let part: Int64?                 // start of the part it carries (nil = the whole file)
+    let length: Int64?
+    let outdated: Bool               // made by an older version of the app
 }
 
 struct DownloadItem: Identifiable, Codable {
@@ -27,8 +45,8 @@ struct DownloadItem: Identifiable, Codable {
     var error: String?
     var headers: [String: String]?   // from a plugin, sent with the download
     var needsResolve: Bool?          // true until plugins/TorBox have looked at the link
-    var preferredName: String?       // file name chosen by a plugin or TorBox
-    var status: String?              // progress note (resolving, connecting, joining)
+    var preferredName: String?       // file name chosen by a plugin, TorBox or the server
+    var status: String?              // progress note (resolving, connecting)
     var sourceURL: URL?              // the link as it was added
     var torboxId: Int?               // TorBox web download ID
     var torboxFileId: Int?           // file inside that TorBox download
@@ -36,9 +54,9 @@ struct DownloadItem: Identifiable, Codable {
     var savedName: String?           // file name in Downloads once finished
     var addedAt: Date?
     var completedAt: Date?
-    var segments: [Segment]?         // set when the file downloads over several connections
+    var segments: [Segment]?         // the file's parts, once its size is known
     var singleConnection: Bool?      // the server can't send parts of this file
-    var mergedThrough: Int?          // parts joined so far (survives app restarts)
+    var layout: Int?                 // 2: parts are saved into one data file
 
     var progress: Double { bytesTotal > 0 ? min(Double(bytesReceived) / Double(bytesTotal), 1) : 0 }
 
@@ -53,29 +71,48 @@ final class DownloadManager: NSObject, ObservableObject {
     @Published private(set) var items: [DownloadItem] = []
     /// Current speed (bytes per second) of each running download.
     @Published private(set) var speeds: [UUID: Double] = [:]
+    /// How many connections each running download is using.
+    @Published private(set) var connectionCounts: [UUID: Int] = [:]
     /// Handed over by iOS when it wakes the app for finished background transfers.
     var backgroundCompletionHandlers: [String: () -> Void] = [:]
 
-    /// Several background sessions ("lanes"). Each part of a file goes through its own
-    /// lane, so the parts travel over separate connections and keep going in the background.
+    // Background transfers: several background sessions ("lanes"), so parts travel over
+    // separate connections and keep going while the app sleeps.
     private var lanes: [URLSession] = []
     private static let laneCount = 8
-    private static let minSplitSize: Int64 = 8 << 20   // smaller files use one connection
-    private static let minPartSize: Int64 = 2 << 20
-
-    private var torboxPoller: Task<Void, Never>?
-    private var samples: [UUID: (time: TimeInterval, bytes: Int64)] = [:]
-    private var liveBytes: [UUID: [Int: Int64]] = [:]   // per-part progress not yet copied into items
-    private var merging = Set<UUID>()
-    private var backgroundTime: [UUID: UIBackgroundTaskIdentifier] = [:]
+    private var nextLane = 0
     /// Background session for TorBox status checks while the app is asleep.
     private var checks: URLSession!
     nonisolated private static let checkPrefix = "torbox-check"
+
+    // In-app connections (see TurboWorker): much faster than background transfers, used
+    // while JDLite is open or kept awake in the background.
+    private var workers: [UUID: [TurboWorker]] = [:]
+    private var directURLs: [UUID: URL] = [:]      // where the file really is, after redirects
+    private var workerLimit: [UUID: Int] = [:]     // lowered when a server refuses extra connections
+    private var jsonReplies = Set<UUID>()
+    private var attempts: [String: (count: Int, position: Int64)] = [:]
+    private var progressLoop: Task<Void, Never>?
+    /// True while downloads can use in-app connections.
+    private var inApp = true
+
+    private static let minPartSize: Int64 = 2 << 20      // files are split into parts at least this big
+    private static let minStealSize: Int64 = 2 << 20     // smallest piece a connection takes over
+    private static let reclaimLimit: Int64 = 16 << 20    // background progress worth keeping
+
+    private var torboxPoller: Task<Void, Never>?
+    private var pollSoon = false
+    private var samples: [UUID: (time: TimeInterval, bytes: Int64)] = [:]
+    private var liveBytes: [UUID: [Int64: Int64]] = [:]  // background part progress not yet copied into items
+    private var bgLive: [UUID: Set<Int64>] = [:]         // parts a background transfer is fetching
+    private var absorbing = Set<String>()
     private var probing = Set<UUID>()
     private var finishUp: UIBackgroundTaskIdentifier = .invalid
     private var pendingRestarts = Set<UUID>()
     private var restartTask: Task<Void, Never>?
+    private var keepAwakeCheck: Task<Void, Never>?
     private var observers: [NSObjectProtocol] = []
+    private var lastSave: TimeInterval = 0
     private let storeURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -87,6 +124,7 @@ final class DownloadManager: NSObject, ObservableObject {
     override init() {
         super.init()
         load()
+        migrateOldParts()
         Self.preparePartsFolder()
         let base = "\(Bundle.main.bundleIdentifier ?? "jdlite").downloads"
         for n in 0..<Self.laneCount {
@@ -100,6 +138,7 @@ final class DownloadManager: NSObject, ObservableObject {
         checkConfig.sessionSendsLaunchEvents = true
         checkConfig.isDiscretionary = false
         checks = URLSession(configuration: checkConfig, delegate: self, delegateQueue: nil)
+        inApp = UIApplication.shared.applicationState != .background
         observeAppState()
         reconcile()
     }
@@ -138,6 +177,8 @@ final class DownloadManager: NSObject, ObservableObject {
 
     func resume(_ id: UUID) {
         guard let item = items.first(where: { $0.id == id }) else { return }
+        clearAttempts(id)
+        workerLimit[id] = nil
         if item.needsResolve == true {
             mutate(id) { $0.state = .resolving; $0.error = nil }
             Task { await runResolve(id) }
@@ -160,8 +201,9 @@ final class DownloadManager: NSObject, ObservableObject {
         case .queued, .resolving:
             mutate(id) { $0.state = .paused; $0.status = nil }
         case .downloading:
-            if merging.contains(id) { return }   // only joining is left: let it finish
-            flushProgress(id)
+            turboStop(id)
+            bgLive[id] = nil
+            refreshProgress(id)
             mutate(id) { $0.state = .paused; $0.status = nil }
             clearTransfer(id)
             startNext()
@@ -175,14 +217,22 @@ final class DownloadManager: NSObject, ObservableObject {
     /// or whatever was downloaded so far.
     func delete(_ ids: Set<UUID>) {
         guard !ids.isEmpty else { return }
+        for id in ids {
+            turboStop(id)
+            bgLive[id] = nil
+            liveBytes[id] = nil
+            directURLs[id] = nil
+            workerLimit[id] = nil
+            jsonReplies.remove(id)
+            clearAttempts(id)
+            clearTransfer(id)
+        }
         Task {
             for (task, _) in await liveTasks(for: ids) { task.cancel() }
         }
         let remaining = items.filter { !ids.contains($0.id) }
         let stillUsed = Set(remaining.compactMap { $0.savedFileName })
         for item in items where ids.contains(item.id) {
-            clearTransfer(item.id)
-            liveBytes[item.id] = nil
             try? FileManager.default.removeItem(at: Self.partsDir(item.id))
             if let name = item.savedFileName, !stillUsed.contains(name) {
                 try? FileManager.default.removeItem(at: Self.downloadsDir.appendingPathComponent(name))
@@ -254,7 +304,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 mutate(id) { $0.torboxId = webId }
                 guard isResolving(id) else { return }
                 setStatus(id, "Waiting for TorBox…")
-                startTorBoxPolling()
+                startTorBoxPolling(restart: true)
             } catch {
                 failResolve(id, "TorBox: " + error.localizedDescription)
             }
@@ -295,7 +345,9 @@ final class DownloadManager: NSObject, ObservableObject {
     // MARK: TorBox
 
     /// One loop checks every link TorBox is still fetching, so API use stays low.
-    private func startTorBoxPolling() {
+    /// `restart` cuts the loop's wait short, so a link that was just added is checked at once.
+    private func startTorBoxPolling(restart: Bool = false) {
+        if restart { pollSoon = true }
         guard torboxPoller == nil else { return }
         torboxPoller = Task {
             await self.pollTorBox()
@@ -304,26 +356,38 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     private func pollTorBox() async {
-        var delay: Double = 2
+        var delay: Double = 1
         var strikes: [UUID: Int] = [:]
         while true {
+            pollSoon = false
             let waiting = items.filter { $0.state == .resolving && $0.torboxId != nil && $0.torboxFileId == nil }
             if waiting.isEmpty { return }
+            // With several links waiting, one request gets the status of all of them.
+            var batch: [Int: TorBoxWebDownload] = [:]
+            if waiting.count > 1, let list = try? await TorBox.shared.webDownloadList() { batch = list }
             for item in waiting {
                 guard let webId = item.torboxId, isResolving(item.id) else { continue }
+                var askedAPI = false
                 do {
-                    let dl = try await TorBox.shared.webDownload(id: webId)
-                    strikes[item.id] = nil
-                    guard isResolving(item.id) else { continue }
-                    if let failure = dl.failure {
-                        mutate(item.id) { $0.torboxId = nil; $0.cloudProgress = nil }   // retry adds it again
-                        failResolve(item.id, "TorBox: " + failure)
-                    } else if dl.ready {
-                        torboxReady(item.id, webId: webId, files: dl.files)
+                    let dl: TorBoxWebDownload
+                    if let known = batch[webId] {
+                        dl = known
                     } else {
-                        mutate(item.id, persist: false) {
-                            $0.status = dl.statusText
-                            $0.cloudProgress = dl.fraction
+                        askedAPI = true
+                        dl = try await TorBox.shared.webDownload(id: webId)
+                    }
+                    strikes[item.id] = nil
+                    if isResolving(item.id) {   // not paused or removed meanwhile
+                        if let failure = dl.failure {
+                            mutate(item.id) { $0.torboxId = nil; $0.cloudProgress = nil }   // retry adds it again
+                            failResolve(item.id, "TorBox: " + failure)
+                        } else if dl.ready {
+                            torboxReady(item.id, webId: webId, files: dl.files)
+                        } else {
+                            mutate(item.id, persist: false) {
+                                $0.status = dl.statusText
+                                $0.cloudProgress = dl.fraction
+                            }
                         }
                     }
                 } catch TorBoxError.gone {
@@ -340,10 +404,16 @@ final class DownloadManager: NSObject, ObservableObject {
                 } catch {
                     failResolve(item.id, "TorBox: " + error.localizedDescription)
                 }
-                try? await Task.sleep(nanoseconds: 300_000_000)
+                if askedAPI { try? await Task.sleep(nanoseconds: 250_000_000) }   // TorBox limits API requests
             }
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            delay = min(delay * 1.5, 10)
+            // Wait before the next round: 1 s, then a little longer each time, up to 8 s.
+            // A newly added link cuts the wait short.
+            var waited: Double = 0
+            while waited < delay, !pollSoon {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                waited += 0.25
+            }
+            delay = pollSoon ? 1 : min(delay * 1.5, 8)
         }
     }
 
@@ -392,11 +462,24 @@ final class DownloadManager: NSObject, ObservableObject {
 
     // MARK: Queue
 
+    private var startingNext = false
+    private var startNextAgain = false
+
     private func startNext() {
-        var active = items.filter { $0.state == .downloading }.count
-        for i in items.indices where active < maxConcurrent && items[i].state == .queued {
-            if begin(at: i) { active += 1 }
+        // Starting a download can finish another (and call this again): go round again then.
+        if startingNext {
+            startNextAgain = true
+            return
         }
+        startingNext = true
+        defer { startingNext = false }
+        repeat {
+            startNextAgain = false
+            var active = items.filter { $0.state == .downloading }.count
+            for i in items.indices where active < maxConcurrent && items[i].state == .queued {
+                if begin(at: i) { active += 1 }
+            }
+        } while startNextAgain
     }
 
     /// The request for the file itself (TorBox downloads use TorBox's permanent link).
@@ -408,52 +491,65 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         var req = URLRequest(url: target)
         for (k, v) in item.headers ?? [:] { req.setValue(v, forHTTPHeaderField: k) }
+        if req.value(forHTTPHeaderField: "Accept-Encoding") == nil {
+            req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")   // byte ranges need the file as it is
+        }
+        return req
+    }
+
+    /// Like `downloadRequest`, but straight to where the first reply came from, which skips
+    /// redirects (and TorBox's API) for every further connection.
+    private func transferRequest(for item: DownloadItem) -> URLRequest? {
+        guard var req = downloadRequest(for: item) else { return nil }
+        if let direct = directURLs[item.id] { req.url = direct }
         return req
     }
 
     /// Starts or continues a queued download. Returns false if it couldn't start.
     @discardableResult
     private func begin(at i: Int) -> Bool {
-        let item = items[i]
-        guard let request = downloadRequest(for: item) else {
+        let id = items[i].id
+        guard let request = downloadRequest(for: items[i]) else {
             items[i].state = .failed
             items[i].error = TorBoxError.noKey.errorDescription
             save()
             return false
         }
-        clearTransfer(item.id)
+        clearTransfer(id)
         items[i].state = .downloading
         items[i].error = nil
         items[i].status = nil
 
-        if let segments = item.segments {
-            // A split download: continue every part that isn't done yet.
-            if segments.allSatisfy({ $0.done }) {
-                save()
-                merge(item.id)
-                return true
-            }
-            for k in segments.indices where !segments[k].done {
-                launchPart(at: i, part: k, request: request)
-            }
-            flushProgress(at: i)
-            save()
+        if items[i].segments != nil, items[i].singleConnection == true {
+            // This server can't send part of a file, so the download starts again.
+            try? FileManager.default.removeItem(at: Self.partsDir(id))
+            items[i].segments = nil
+            items[i].bytesReceived = 0
+        }
+        if items[i].segments != nil {
+            drive(i)   // carry on with every part that isn't done yet
             return true
         }
-
-        let fresh = item.resumeData == nil && item.bytesReceived == 0
-        if fresh && item.singleConnection != true && AppSettings.shared.connectionsPerDownload > 1 {
+        let item = items[i]
+        if inApp {
+            if item.resumeData != nil, item.bytesReceived >= Self.reclaimLimit {
+                // A background download that got a good way: let it finish where it is.
+                startWhole(item, request: request)
+            } else {
+                startFresh(at: i, request: request)
+            }
+        } else if item.resumeData == nil, item.singleConnection != true {
             items[i].status = "Connecting…"
-            save()
-            Task { await self.split(item.id, request: request) }
-            return true
+            Task { await self.backgroundSplit(id, request: request) }
+        } else {
+            startWhole(item, request: request)
         }
-        startWhole(item, request: request)
         items[i].resumeData = nil
         save()
         return true
     }
 
+    /// A whole file in one background transfer (for servers that can't send parts).
     private func startWhole(_ item: DownloadItem, request: URLRequest) {
         let task: URLSessionDownloadTask
         if let data = item.resumeData {
@@ -465,12 +561,451 @@ final class DownloadManager: NSObject, ObservableObject {
         task.resume()
     }
 
-    /// Starts one part of a split download in its own lane.
-    private func launchPart(at i: Int, part k: Int, request: URLRequest) {
-        guard let segs = items[i].segments, segs.indices.contains(k) else { return }
+    // MARK: In-app connections
+
+    /// Starts a new download over one in-app connection. The server's first reply says how
+    /// big the file is; the download is then shared out over more connections.
+    private func startFresh(at i: Int, request: URLRequest) {
         let id = items[i].id
-        let seg = segs[k]
-        let lane = lanes[k % lanes.count]
+        turboStop(id)
+        try? FileManager.default.removeItem(at: Self.partsDir(id))
+        items[i].segments = nil
+        items[i].layout = 2
+        items[i].bytesReceived = 0
+        items[i].status = "Connecting…"
+        directURLs[id] = nil
+        jsonReplies.remove(id)
+        spawnWorker(id, part: 0, from: 0, end: TurboWorker.unknownEnd, request: request, reply: true)
+    }
+
+    private func spawnWorker(_ id: UUID, part: Int64, from: Int64, end: Int64, request: URLRequest,
+                             reply: Bool = false) {
+        let worker = TurboWorker(downloadID: id, fileURL: Self.dataURL(id))
+        workers[id, default: []].append(worker)
+        worker.start(part: part, from: from, end: end, request: request, reportReply: reply)
+        ensureProgressLoop()
+    }
+
+    /// The first reply of a new download: learn its size and name, then split it up.
+    func turboReply(_ worker: TurboWorker, _ reply: TurboReply) {
+        let id = worker.downloadID
+        guard isCurrent(worker), let i = index(of: id), items[i].state == .downloading,
+              items[i].segments == nil else { return }
+        items[i].status = nil
+        if let url = reply.finalURL { directURLs[id] = url }
+        if reply.isJSON { jsonReplies.insert(id) }
+        if items[i].preferredName == nil, let name = reply.suggestedName, !name.isEmpty {
+            // Use the server's name if it gave one, or if the link didn't look like a file name.
+            let current = items[i].fileName as NSString
+            if reply.namedByServer || current.pathExtension.isEmpty {
+                items[i].preferredName = Self.cleanName(name)
+                items[i].fileName = Self.cleanName(name)
+            }
+        }
+        items[i].bytesTotal = max(reply.total ?? 0, 0)
+        items[i].layout = 2
+        // Without byte ranges and a known size, a file can't be split or picked up part-way.
+        let canSplit = reply.acceptsRanges && reply.total != nil && items[i].singleConnection != true
+        if !canSplit { items[i].singleConnection = true }
+        let last = reply.total.map { $0 - 1 } ?? TurboWorker.unknownEnd
+        items[i].segments = [Segment(start: 0, end: last)]
+        if canSplit, let total = reply.total, total > 0 {
+            splitEvenly(at: i, worker: worker, total: total)
+        }
+        save()
+    }
+
+    /// Shares a new download out over several connections in equal parts.
+    private func splitEvenly(at i: Int, worker: TurboWorker, total: Int64) {
+        let id = items[i].id
+        let n = Int(min(Int64(connectionLimit(for: id)), max(1, total / Self.minPartSize)))
+        guard n >= 2, let request = transferRequest(for: items[i]) else { return }
+        let size = total / Int64(n)
+        guard worker.shrink(toEnd: size - 1) else {
+            // Already past that point: share out what's left (if it's still going at all;
+            // a small file may have finished already).
+            if worker.currentPart != nil { fillConnections(at: i) }
+            return
+        }
+        var segs: [Segment] = []
+        for k in 0..<n {
+            let start = Int64(k) * size
+            let end = k == n - 1 ? total - 1 : start + size - 1
+            segs.append(Segment(start: start, end: end))
+        }
+        items[i].segments = segs
+        for s in segs.dropFirst() {
+            spawnWorker(id, part: s.start, from: s.start, end: s.end, request: request)
+        }
+    }
+
+    /// Adds in-app connections until the download uses as many as it's allowed.
+    private func fillConnections(at i: Int) {
+        guard inApp, items[i].state == .downloading, items[i].segments != nil,
+              let request = transferRequest(for: items[i]) else { return }
+        let id = items[i].id
+        let single = items[i].singleConnection == true
+        let limit = single ? 1 : connectionLimit(for: id)
+        var added = 0
+        while connectionsInUse(id) < limit, added < 32, let job = nextJob(at: i, steal: !single) {
+            spawnWorker(id, part: job.part, from: job.from, end: job.end, request: request)
+            added += 1
+        }
+    }
+
+    /// The next stretch of a download for a free connection: a part nobody is working on,
+    /// or else the second half of what the busiest connection still has to fetch.
+    private func nextJob(at i: Int, steal: Bool) -> (part: Int64, from: Int64, end: Int64)? {
+        guard var segs = items[i].segments else { return nil }
+        let id = items[i].id
+        let taken = busyParts(id).union(bgLive[id] ?? [])
+        if let s = segs.first(where: { !$0.done && $0.background != true && $0.end != TurboWorker.unknownEnd
+                                        && !taken.contains($0.start) && $0.received < $0.length }) {
+            return (part: s.start, from: s.start + s.received, end: s.end)
+        }
+        guard steal else { return nil }
+        var victim: TurboWorker?
+        var most: Int64 = 0
+        for worker in workers[id] ?? [] {
+            if let left = worker.bytesLeft, left > most {
+                victim = worker
+                most = left
+            }
+        }
+        guard let victim, most >= Self.minStealSize * 2,
+              let cut = victim.giveAwayHalf(minimum: Self.minStealSize) else { return nil }
+        if let k = segs.firstIndex(where: { $0.start == cut.part }) { segs[k].end = cut.start - 1 }
+        segs.append(Segment(start: cut.start, end: cut.end))
+        segs.sort { $0.start < $1.start }
+        items[i].segments = segs
+        return (part: cut.start, from: cut.start, end: cut.end)
+    }
+
+    /// A connection finished a stretch of work (or failed at it).
+    func turboDone(_ worker: TurboWorker, part: Int64, outcome: TurboOutcome, position: Int64, end: Int64) {
+        let id = worker.downloadID
+        guard isCurrent(worker) else { return }   // stopped meanwhile
+        guard let i = index(of: id), items[i].state == .downloading else {
+            retire(worker)
+            return
+        }
+        switch outcome {
+        case .finished:
+            if items[i].segments == nil {
+                // A small file that arrived before its first reply was handled.
+                items[i].segments = [Segment(start: 0, end: position - 1)]
+                items[i].bytesTotal = position
+                items[i].layout = 2
+            }
+            if var segs = items[i].segments, let k = segs.firstIndex(where: { $0.start == part }) {
+                if segs[k].end == TurboWorker.unknownEnd {
+                    segs[k].end = position - 1
+                    items[i].bytesTotal = position
+                }
+                segs[k].received = segs[k].length
+                segs[k].done = true
+                items[i].segments = segs
+            }
+            attempts[Self.partKey(id, part)] = nil
+            refreshProgress(at: i)
+            continueWork(worker, at: i)
+        case .incomplete:
+            recordProgress(at: i, part: part, position: position)
+            if let delay = nextAttempt(id, part: part, position: position) {
+                retry(worker, after: delay)
+            } else {
+                retire(worker)
+                failDownload(id, message: "The server keeps dropping the connection. Tap retry to carry on.")
+            }
+        case .failed(let message, let retryable):
+            recordProgress(at: i, part: part, position: position)
+            if retryable, let delay = nextAttempt(id, part: part, position: position) {
+                retry(worker, after: delay)
+            } else {
+                retire(worker)
+                failDownload(id, message: message)
+            }
+        case .http(let status, let message):
+            recordProgress(at: i, part: part, position: position)
+            httpTrouble(worker, at: i, part: part, position: position, status: status, message: message)
+        case .webPage:
+            retire(worker)
+            gotWebPage(id)
+        case .rangesIgnored:
+            retire(worker)
+            fallBackToWhole(at: i)
+        }
+    }
+
+    private func httpTrouble(_ worker: TurboWorker, at i: Int, part: Int64, position: Int64,
+                             status: Int, message: String?) {
+        let id = items[i].id
+        let others = (workers[id]?.count ?? 1) - 1
+        if status == 429 || status == 503, others > 0 {
+            // The server limits how many connections it allows: carry on with fewer.
+            workerLimit[id] = max(1, others)
+            retire(worker)
+            return
+        }
+        if [401, 403, 404, 410].contains(status), directURLs[id] != nil {
+            // The direct link may have expired: go through the original link again.
+            directURLs[id] = nil
+            if let delay = nextAttempt(id, part: part, position: position) {
+                retry(worker, after: delay)
+                return
+            }
+        }
+        if status == 429 || status >= 500, let delay = nextAttempt(id, part: part, position: position) {
+            retry(worker, after: max(delay, 2))
+            return
+        }
+        retire(worker)
+        let text = message.map { "HTTP \(status): \($0)" } ?? "HTTP \(status)"
+        failDownload(id, message: text, resolveAgain: true)
+    }
+
+    /// Gives a connection that finished its job something else to do, or lets it go.
+    private func continueWork(_ worker: TurboWorker, at i: Int) {
+        let id = items[i].id
+        normalize(at: i)
+        if items[i].segments?.allSatisfy({ $0.done }) == true {
+            completeFile(at: i)
+            return
+        }
+        let single = items[i].singleConnection == true
+        let limit = single ? 1 : connectionLimit(for: id)
+        if inApp, connectionsInUse(id) <= limit,
+           let job = nextJob(at: i, steal: !single),
+           let request = transferRequest(for: items[i]) {
+            worker.start(part: job.part, from: job.from, end: job.end, request: request)
+        } else {
+            retire(worker)
+        }
+        save()
+    }
+
+    /// Tries a connection's work again after a pause.
+    private func retry(_ worker: TurboWorker, after delay: Double) {
+        let id = worker.downloadID
+        Task {
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard self.isCurrent(worker), let i = self.index(of: id),
+                  self.items[i].state == .downloading else { return }
+            if self.items[i].segments == nil || self.items[i].singleConnection == true {
+                // Nothing to carry on from: start the download again.
+                self.retire(worker)
+                if let request = self.downloadRequest(for: self.items[i]) {
+                    self.startFresh(at: i, request: request)
+                }
+                self.save()
+            } else {
+                self.continueWork(worker, at: i)
+            }
+        }
+    }
+
+    /// Counts tries at a part that make no progress. Returns how long to wait before the
+    /// next try, or nil to give up.
+    private func nextAttempt(_ id: UUID, part: Int64, position: Int64) -> Double? {
+        let key = Self.partKey(id, part)
+        var entry = attempts[key] ?? (count: 0, position: Int64.min)
+        if position > entry.position { entry = (count: 0, position: position) }   // it got further: count again
+        entry.count += 1
+        attempts[key] = entry
+        let delays: [Double] = [0.5, 1, 2, 4, 8, 15]
+        return entry.count <= delays.count ? delays[entry.count - 1] : nil
+    }
+
+    private func clearAttempts(_ id: UUID) {
+        let prefix = id.uuidString + "/"
+        attempts = attempts.filter { !$0.key.hasPrefix(prefix) }
+    }
+
+    private func recordProgress(at i: Int, part: Int64, position: Int64) {
+        guard var segs = items[i].segments, let k = segs.firstIndex(where: { $0.start == part }),
+              !segs[k].done, segs[k].end != TurboWorker.unknownEnd else { return }
+        segs[k].received = min(max(position - part, 0), segs[k].length)
+        items[i].segments = segs
+    }
+
+    /// Stops a download's in-app connections, keeping what they've saved.
+    private func turboStop(_ id: UUID) {
+        guard let list = workers.removeValue(forKey: id) else { return }
+        let i = index(of: id)
+        for worker in list {
+            guard let reached = worker.stop(), let i else { continue }
+            recordProgress(at: i, part: reached.part, position: reached.position)
+        }
+    }
+
+    private func retire(_ worker: TurboWorker) {
+        worker.stop()
+        let id = worker.downloadID
+        workers[id]?.removeAll { $0 === worker }
+        if workers[id]?.isEmpty == true { workers[id] = nil }
+    }
+
+    private func isCurrent(_ worker: TurboWorker) -> Bool {
+        workers[worker.downloadID]?.contains { $0 === worker } == true
+    }
+
+    private func busyParts(_ id: UUID) -> Set<Int64> {
+        Set((workers[id] ?? []).compactMap { $0.currentPart })
+    }
+
+    private func connectionsInUse(_ id: UUID) -> Int {
+        (workers[id]?.count ?? 0) + (bgLive[id]?.count ?? 0)
+    }
+
+    private func connectionLimit(for id: UUID) -> Int {
+        max(1, min(AppSettings.shared.connectionsPerDownload, workerLimit[id] ?? Int.max))
+    }
+
+    /// Marks parts whose bytes are all saved as done.
+    private func normalize(at i: Int) {
+        guard var segs = items[i].segments else { return }
+        var changed = false
+        for k in segs.indices where !segs[k].done && segs[k].background != true
+            && segs[k].end != TurboWorker.unknownEnd && segs[k].received >= segs[k].length {
+            segs[k].done = true
+            segs[k].received = segs[k].length
+            changed = true
+        }
+        if changed { items[i].segments = segs }
+    }
+
+    /// Every part is saved: move the finished file into Downloads.
+    private func completeFile(at i: Int) {
+        let id = items[i].id
+        if let list = workers.removeValue(forKey: id) {
+            for worker in list { worker.stop() }
+        }
+        guard let segs = items[i].segments, let lastByte = segs.map({ $0.end }).max() else { return }
+        let total = max(lastByte + 1, 0)
+        let data = Self.dataURL(id)
+        ensureFileExists(data)
+        if Self.fileSize(data) > total, let handle = try? FileHandle(forWritingTo: data) {
+            try? handle.truncate(atOffset: UInt64(total))
+            try? handle.close()
+        }
+        if jsonReplies.remove(id) != nil, let json = Self.smallJSON(at: data), (json["success"] as? Bool) == false {
+            // The "file" was an error message from the server.
+            try? FileManager.default.removeItem(at: Self.partsDir(id))
+            items[i].segments = nil
+            items[i].bytesReceived = 0
+            downloadFailed(id, message: Self.message(in: json) ?? "The server returned an error.")
+            return
+        }
+        let name = Self.cleanName(items[i].preferredName ?? items[i].fileName)
+        let dest = Self.uniqueURL(for: name)
+        do {
+            try FileManager.default.moveItem(at: data, to: dest)
+            try? FileManager.default.removeItem(at: Self.partsDir(id))
+            finished(id, savedName: dest.lastPathComponent, size: Self.fileSize(dest))
+        } catch {
+            mutate(id) {
+                $0.state = .failed
+                $0.status = nil
+                $0.error = "Couldn't save the file: " + error.localizedDescription
+            }
+            notifyFailed(id)
+            startNext()
+        }
+    }
+
+    /// Stops a download that keeps failing, keeping its progress so retry carries on.
+    private func failDownload(_ id: UUID, message: String, resolveAgain: Bool = false) {
+        turboStop(id)
+        bgLive[id] = nil
+        refreshProgress(id)
+        mutate(id) {
+            $0.state = .failed
+            $0.error = message
+            $0.status = nil
+            // Links found by a plugin can expire, so look the page up again on retry.
+            if resolveAgain, $0.torboxFileId == nil, let source = $0.sourceURL, source != $0.url {
+                $0.needsResolve = true
+            }
+        }
+        notifyFailed(id)
+        clearTransfer(id)
+        startNext()
+        Task { await stopTransfers(for: id) }
+    }
+
+    // MARK: Keeping parts moving
+
+    /// Keeps every unfinished part of a download moving: in-app connections while JDLite can
+    /// use them, background transfers otherwise. Also saves parts that arrived in the background.
+    private func drive(_ i: Int) {
+        guard items[i].state == .downloading, items[i].segments != nil else { return }
+        let id = items[i].id
+        normalize(at: i)
+        guard var segs = items[i].segments else { return }
+        if segs.allSatisfy({ $0.done }) {
+            if workers[id] == nil, (bgLive[id] ?? []).isEmpty { completeFile(at: i) }
+            return
+        }
+        guard let request = transferRequest(for: items[i]) else {
+            failDownload(id, message: TorBoxError.noKey.errorDescription ?? "Add your TorBox API key.")
+            return
+        }
+        let live = bgLive[id] ?? []
+        let busy = busyParts(id)
+        var launch: [Int64] = []
+        var ready: [Int64] = []
+        for start in segs.map({ $0.start }) {
+            guard let k = segs.firstIndex(where: { $0.start == start }) else { continue }
+            let s = segs[k]
+            if s.done || live.contains(start) || busy.contains(start)
+                || absorbing.contains(Self.partKey(id, start)) { continue }
+            if s.background == true, Self.partReady(id, s) {
+                ready.append(start)
+                continue
+            }
+            if inApp {
+                guard s.background == true else { continue }   // fillConnections picks it up
+                if s.resumeData != nil, s.received >= Self.reclaimLimit {
+                    launch.append(start)   // got a good way in the background: let it finish there
+                } else {
+                    segs[k].background = nil
+                    segs[k].received = 0
+                    segs[k].resumeData = nil
+                    try? FileManager.default.removeItem(at: Self.partURL(id, start))
+                }
+            } else if s.background == true {
+                launch.append(start)
+            } else if s.end == TurboWorker.unknownEnd {
+                continue   // size unknown: handOff restarts these
+            } else if s.received > 0 {
+                // Keep what's saved; fetch the rest in the background.
+                segs[k].end = s.start + s.received - 1
+                segs[k].received = segs[k].length
+                segs[k].done = true
+                var rest = Segment(start: s.start + s.received, end: s.end)
+                rest.background = true
+                segs.append(rest)
+                launch.append(rest.start)
+            } else {
+                segs[k].background = true
+                launch.append(start)
+            }
+        }
+        segs.sort { $0.start < $1.start }
+        items[i].segments = segs
+        for start in launch { launchBackground(at: i, part: start, request: request) }
+        for start in ready { absorb(id, part: start) }
+        if inApp { fillConnections(at: i) }
+        save()
+    }
+
+    /// Starts a background transfer for one part.
+    private func launchBackground(at i: Int, part start: Int64, request: URLRequest) {
+        guard let k = items[i].segments?.firstIndex(where: { $0.start == start }),
+              let seg = items[i].segments?[k] else { return }
+        let id = items[i].id
+        let lane = lanes[nextLane % lanes.count]
+        nextLane += 1
         let task: URLSessionDownloadTask
         if let data = seg.resumeData {
             task = lane.downloadTask(withResumeData: data)
@@ -479,19 +1014,47 @@ final class DownloadManager: NSObject, ObservableObject {
             req.setValue("bytes=\(seg.start)-\(seg.end)", forHTTPHeaderField: "Range")
             task = lane.downloadTask(with: req)
             items[i].segments?[k].received = 0
-            liveBytes[id]?[k] = nil
+            liveBytes[id]?[start] = nil
         }
+        items[i].segments?[k].background = true
         items[i].segments?[k].resumeData = nil
-        task.taskDescription = Self.describe(id, name: items[i].preferredName, part: k, length: seg.length)
+        task.taskDescription = Self.describe(id, name: items[i].preferredName, part: start, length: seg.length)
         task.resume()
+        bgLive[id, default: []].insert(start)
     }
 
-    // MARK: Split downloads
-
-    private struct Probe: Sendable {
-        let total: Int64
-        let acceptsRanges: Bool
+    /// Moves a download from in-app connections to iOS's background downloader.
+    private func handOff(_ id: UUID) {
+        guard let i = index(of: id), items[i].state == .downloading else { return }
+        let hadWorkers = workers[id] != nil
+        turboStop(id)
+        guard let segs = items[i].segments, items[i].singleConnection != true,
+              !segs.contains(where: { $0.end == TurboWorker.unknownEnd }) else {
+            // Nothing to carry on from (no reply yet, or a server that can't send parts):
+            // start it again in the background.
+            if hadWorkers { restartInBackground(at: i) }
+            return
+        }
+        drive(i)
     }
+
+    private func restartInBackground(at i: Int) {
+        let id = items[i].id
+        try? FileManager.default.removeItem(at: Self.partsDir(id))
+        items[i].segments = nil
+        items[i].bytesReceived = 0
+        items[i].layout = nil
+        guard let request = downloadRequest(for: items[i]) else { return }
+        if items[i].singleConnection == true {
+            startWhole(items[i], request: request)
+        } else {
+            items[i].status = "Connecting…"
+            Task { await self.backgroundSplit(id, request: request) }
+        }
+        save()
+    }
+
+    // MARK: Background parts
 
     nonisolated private static let probeSession: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
@@ -528,46 +1091,52 @@ final class DownloadManager: NSObject, ObservableObject {
         }
     }
 
-    /// Splits a new download into parts if the server allows it, else uses one connection.
-    private func split(_ id: UUID, request: URLRequest) async {
+    /// Starts a new download while JDLite is in the background: split into parts for iOS's
+    /// background downloader if the server allows it, else one transfer for the whole file.
+    private func backgroundSplit(_ id: UUID, request: URLRequest) async {
         probing.insert(id)
         defer { probing.remove(id) }
         if UIApplication.shared.applicationState == .background { beginFinishUpTime() }
         let probe = await Self.probe(request)
-        guard let i = items.firstIndex(where: { $0.id == id }), items[i].state == .downloading,
-              items[i].segments == nil else { return }   // paused or deleted meanwhile
+        guard let i = index(of: id), items[i].state == .downloading, items[i].segments == nil,
+              workers[id] == nil else { return }   // paused, deleted or started meanwhile
         items[i].status = nil
-        if let probe, probe.acceptsRanges, probe.total >= Self.minSplitSize {
-            let parts = Int(min(Int64(AppSettings.shared.connectionsPerDownload), probe.total / Self.minPartSize))
-            if parts >= 2 {
-                try? FileManager.default.removeItem(at: Self.partsDir(id))
-                items[i].bytesTotal = probe.total
-                items[i].mergedThrough = nil
-                items[i].segments = Self.makeSegments(total: probe.total, parts: parts)
-                for k in 0..<parts { launchPart(at: i, part: k, request: request) }
-                save()
-                return
-            }
+        if inApp {
+            startFresh(at: i, request: request)   // JDLite is open again: use in-app connections
+            save()
+            return
+        }
+        if let probe, probe.acceptsRanges, probe.total > 0 {
+            let parts = Int(min(Int64(AppSettings.shared.connectionsPerDownload), max(1, probe.total / Self.minPartSize)))
+            try? FileManager.default.removeItem(at: Self.partsDir(id))
+            items[i].bytesTotal = probe.total
+            items[i].layout = 2
+            var segs = Self.makeSegments(total: probe.total, parts: max(parts, 1))
+            for k in segs.indices { segs[k].background = true }
+            items[i].segments = segs
+            for s in segs { launchBackground(at: i, part: s.start, request: request) }
+            save()
+            return
         }
         if probe?.acceptsRanges == false { items[i].singleConnection = true }
         startWhole(items[i], request: request)
         save()
     }
 
-    /// Running transfers for these downloads, with the part each carries (nil = whole file).
-    private func liveTasks(for ids: Set<UUID>) async -> [(task: URLSessionTask, part: Int?)] {
-        var out: [(task: URLSessionTask, part: Int?)] = []
+    /// Running background transfers for these downloads, with the part each carries (nil = whole file).
+    private func liveTasks(for ids: Set<UUID>) async -> [(task: URLSessionTask, part: Int64?)] {
+        var out: [(task: URLSessionTask, part: Int64?)] = []
         for lane in lanes {
             for task in await lane.allTasks {
-                if let d = Self.parseDesc(task.taskDescription), ids.contains(d.id) {
-                    out.append((task: task, part: d.part))
+                if let tag = Self.parseDesc(task.taskDescription), !tag.outdated, ids.contains(tag.id) {
+                    out.append((task: task, part: tag.part))
                 }
             }
         }
         return out
     }
 
-    /// Cancels a download's transfers, keeping resume data so it can carry on later.
+    /// Cancels a download's background transfers, keeping resume data so it can carry on later.
     private func stopTransfers(for id: UUID) async {
         for (task, part) in await liveTasks(for: [id]) {
             if let download = task as? URLSessionDownloadTask {
@@ -579,217 +1148,164 @@ final class DownloadManager: NSObject, ObservableObject {
         }
     }
 
-    private func keepResumeData(_ id: UUID, part: Int?, data: Data?) {
-        guard let i = items.firstIndex(where: { $0.id == id }),
-              items[i].state == .paused || items[i].state == .failed else { return }
+    private func keepResumeData(_ id: UUID, part: Int64?, data: Data?) {
+        guard let i = index(of: id), items[i].state == .paused || items[i].state == .failed else { return }
         if let part {
-            guard let segs = items[i].segments, segs.indices.contains(part) else { return }
-            items[i].segments?[part].resumeData = data
+            guard let k = items[i].segments?.firstIndex(where: { $0.start == part }) else { return }
+            items[i].segments?[k].resumeData = data
         } else {
             items[i].resumeData = data
         }
         save()
     }
 
-    fileprivate func partFinished(_ id: UUID, part k: Int, moved: Bool, ok: Bool, size: Int64, status: Int) {
-        guard let i = items.firstIndex(where: { $0.id == id }), let segs = items[i].segments,
-              segs.indices.contains(k) else {
+    fileprivate func partFinished(_ id: UUID, part start: Int64, moved: Bool, ok: Bool, size: Int64, status: Int) {
+        bgLive[id]?.remove(start)
+        liveBytes[id]?[start] = nil
+        let file = Self.partURL(id, start)
+        guard let i = index(of: id) else {
             try? FileManager.default.removeItem(at: Self.partsDir(id))   // deleted meanwhile
             return
         }
-        let file = Self.partURL(id, k)
-        let length = segs[k].length
-        guard moved, ok, size >= length else {
-            try? FileManager.default.removeItem(at: file)
-            if status == 200 { fallBackToWhole(at: i); return }   // the server ignored the range
-            partFailed(id, part: k, message: "Part \(k + 1) of the file came back incomplete.", resumeData: nil)
+        guard let k = items[i].segments?.firstIndex(where: { $0.start == start }),
+              let seg = items[i].segments?[k], seg.background == true, !seg.done else {
+            try? FileManager.default.removeItem(at: file)   // no longer needed
             return
         }
-        if size > length, let handle = try? FileHandle(forWritingTo: file) {
+        guard moved, ok, size >= seg.length else {
+            try? FileManager.default.removeItem(at: file)
+            if status == 200 {
+                if items[i].state == .downloading { fallBackToWhole(at: i) }   // the server ignored the range
+                return
+            }
+            partFailed(id, part: start, message: "Part of the file came back incomplete.", resumeData: nil)
+            return
+        }
+        if size > seg.length, let handle = try? FileHandle(forWritingTo: file) {
             // The server sent more than asked for; the first `length` bytes are this part.
-            try? handle.truncate(atOffset: UInt64(length))
+            try? handle.truncate(atOffset: UInt64(seg.length))
             try? handle.close()
         }
-        items[i].segments?[k].done = true
-        items[i].segments?[k].received = length
+        items[i].segments?[k].received = seg.length
         items[i].segments?[k].resumeData = nil
-        liveBytes[id]?[k] = nil
-        flushProgress(at: i)
         save()
-        if items[i].segments?.allSatisfy({ $0.done }) == true, items[i].state == .downloading {
-            merge(id)
+        absorb(id, part: start)
+    }
+
+    /// Copies a part that arrived in the background into the download's data file.
+    private func absorb(_ id: UUID, part start: Int64) {
+        let key = Self.partKey(id, start)
+        guard !absorbing.contains(key), let i = index(of: id),
+              let seg = items[i].segments?.first(where: { $0.start == start }) else { return }
+        absorbing.insert(key)
+        if UIApplication.shared.applicationState == .background { beginFinishUpTime() }
+        let length = seg.length
+        Task {
+            let ok = await Self.absorbPart(id, start: start, length: length)
+            self.absorbing.remove(key)
+            self.partSaved(id, part: start, ok: ok)
         }
     }
 
-    fileprivate func partFailed(_ id: UUID, part k: Int, message: String, resumeData: Data?) {
-        guard let i = items.firstIndex(where: { $0.id == id }), let segs = items[i].segments,
-              segs.indices.contains(k) else { return }
+    private func partSaved(_ id: UUID, part start: Int64, ok: Bool) {
+        guard let i = index(of: id) else {
+            try? FileManager.default.removeItem(at: Self.partsDir(id))   // deleted meanwhile
+            return
+        }
+        guard let k = items[i].segments?.firstIndex(where: { $0.start == start }) else { return }
+        guard ok else {
+            if items[i].state == .downloading {
+                failDownload(id, message: "Couldn't save part of the download. Check there's enough free space, then tap retry.")
+            }
+            return
+        }
+        items[i].segments?[k].done = true
+        items[i].segments?[k].background = nil
+        items[i].segments?[k].resumeData = nil
+        if let length = items[i].segments?[k].length { items[i].segments?[k].received = length }
+        refreshProgress(at: i)
+        save()
+        // Finishes the file once every part is in, or puts the free connection to work.
+        if items[i].state == .downloading { drive(i) }
+    }
+
+    fileprivate func partFailed(_ id: UUID, part start: Int64, message: String, resumeData: Data?) {
+        bgLive[id]?.remove(start)
+        liveBytes[id]?[start] = nil
+        guard let i = index(of: id), let k = items[i].segments?.firstIndex(where: { $0.start == start }) else { return }
         items[i].segments?[k].resumeData = resumeData
-        liveBytes[id]?[k] = nil
         guard items[i].state == .downloading else { save(); return }   // paused or failed already
-        let retries = segs[k].retries + 1
+        directURLs[id] = nil   // in case the direct link expired
+        let retries = (items[i].segments?[k].retries ?? 0) + 1
         items[i].segments?[k].retries = retries
         save()
         if retries <= 3 {
             Task {
                 try? await Task.sleep(nanoseconds: UInt64(retries) * 2_000_000_000)
-                self.retryPart(id, part: k)
+                if let j = self.index(of: id), self.items[j].state == .downloading { self.drive(j) }
             }
         } else {
-            failSplit(id, message: message)
+            failDownload(id, message: message)
         }
     }
 
-    private func retryPart(_ id: UUID, part k: Int) {
-        guard let i = items.firstIndex(where: { $0.id == id }), items[i].state == .downloading,
-              let segs = items[i].segments, segs.indices.contains(k), !segs[k].done,
-              let request = downloadRequest(for: items[i]) else { return }
-        launchPart(at: i, part: k, request: request)
-        save()
-    }
-
-    /// A part isn't the byte range we asked for: restart it, or give up on splitting this file.
-    fileprivate func partMismatch(_ id: UUID, part k: Int, rangesIgnored: Bool) {
-        guard let i = items.firstIndex(where: { $0.id == id }), items[i].state == .downloading,
-              let segs = items[i].segments, segs.indices.contains(k) else { return }
-        if rangesIgnored || (segs[k].resumeData == nil && segs[k].received == 0) {
+    /// A background part isn't the byte range we asked for: fetch it again, or give up on
+    /// splitting this file.
+    fileprivate func partMismatch(_ id: UUID, part start: Int64, rangesIgnored: Bool) {
+        bgLive[id]?.remove(start)
+        liveBytes[id]?[start] = nil
+        guard let i = index(of: id), items[i].state == .downloading,
+              let k = items[i].segments?.firstIndex(where: { $0.start == start }) else { return }
+        let retries = (items[i].segments?[k].retries ?? 0) + 1
+        if rangesIgnored || retries > 2 {
             fallBackToWhole(at: i)
-        } else {
-            // Resuming this part went wrong: start it again from its beginning.
-            items[i].segments?[k].resumeData = nil
-            items[i].segments?[k].received = 0
-            liveBytes[id]?[k] = nil
-            save()
-            retryPart(id, part: k)
+            return
         }
-    }
-
-    /// Stops a split download that keeps failing, keeping its progress for a retry.
-    private func failSplit(_ id: UUID, message: String) {
-        flushProgress(id)
-        mutate(id) { $0.state = .failed; $0.error = message; $0.status = nil }
-        notifyFailed(id)
-        clearTransfer(id)
-        startNext()
-        Task { await stopTransfers(for: id) }
+        items[i].segments?[k].retries = retries
+        items[i].segments?[k].resumeData = nil
+        items[i].segments?[k].received = 0
+        save()
+        drive(i)
     }
 
     /// The server won't send parts after all: download the file over one connection.
     private func fallBackToWhole(at i: Int) {
         let id = items[i].id
+        turboStop(id)
+        try? FileManager.default.removeItem(at: Self.partsDir(id))
         items[i].segments = nil
-        items[i].mergedThrough = nil
         items[i].singleConnection = true
         items[i].bytesReceived = 0
+        items[i].layout = nil
         liveBytes[id] = nil
+        bgLive[id] = nil
         clearTransfer(id)
         save()
         Task {
             for (task, part) in await self.liveTasks(for: [id]) where part != nil { task.cancel() }
-            try? FileManager.default.removeItem(at: Self.partsDir(id))
-            guard let j = self.items.firstIndex(where: { $0.id == id }), self.items[j].state == .downloading,
+            guard let j = self.index(of: id), self.items[j].state == .downloading,
+                  self.items[j].segments == nil, self.workers[id] == nil,
                   let request = self.downloadRequest(for: self.items[j]) else { return }
-            self.startWhole(self.items[j], request: request)
-        }
-    }
-
-    // MARK: Joining parts
-
-    private func merge(_ id: UUID) {
-        guard !merging.contains(id), let i = items.firstIndex(where: { $0.id == id }),
-              let segs = items[i].segments, !segs.isEmpty, segs.allSatisfy({ $0.done }) else { return }
-        merging.insert(id)
-        items[i].status = "Joining parts…"
-        clearTransfer(id)
-        let name = Self.cleanName(items[i].preferredName ?? items[i].fileName)
-        let startAt = min(max(items[i].mergedThrough ?? 0, 0), segs.count - 1)
-        // Ask iOS for extra time in case this happens while the app is in the background.
-        // If time runs out, the join carries on from its last checkpoint next time.
-        backgroundTime[id] = UIApplication.shared.beginBackgroundTask(withName: "Join parts") { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                self.endBackgroundTime(id)
+            if self.inApp {
+                self.startFresh(at: j, request: request)
+            } else {
+                self.startWhole(self.items[j], request: request)
             }
-        }
-        Task {
-            let joined = await self.joinParts(id, segments: segs, startAt: startAt)
-            self.merging.remove(id)
-            self.joinFinished(id, joined: joined, name: name)
-            self.endBackgroundTime(id)
+            self.save()
         }
     }
 
-    private func endBackgroundTime(_ id: UUID) {
-        if let task = backgroundTime.removeValue(forKey: id), task != .invalid {
-            UIApplication.shared.endBackgroundTask(task)
-        }
-    }
-
-    /// Appends parts 1...n onto part 0, in order, checkpointing after each part so an
-    /// interrupted join can carry on later. Runs off the main thread.
-    private nonisolated func joinParts(_ id: UUID, segments: [Segment], startAt: Int) async -> URL? {
-        let first = Self.partURL(id, 0)
-        do {
-            let out = try FileHandle(forWritingTo: first)
-            defer { try? out.close() }
-            // Part 0 holds parts 0...startAt; drop anything a previous join half-wrote.
-            try out.truncate(atOffset: UInt64(segments[startAt].end + 1))
-            _ = try out.seekToEnd()
-            var k = startAt + 1
-            while k < segments.count {
-                let part = Self.partURL(id, k)
-                let input = try FileHandle(forReadingFrom: part)
-                while let chunk = try input.read(upToCount: 8 << 20), !chunk.isEmpty {
-                    try out.write(contentsOf: chunk)
-                }
-                try input.close()
-                try out.synchronize()
-                try? FileManager.default.removeItem(at: part)
-                await self.recordJoined(id, through: k)
-                k += 1
-            }
-            return first
-        } catch {
-            return nil
-        }
-    }
-
-    private func recordJoined(_ id: UUID, through k: Int) {
-        mutate(id) { $0.mergedThrough = k }
-    }
-
-    private func joinFinished(_ id: UUID, joined: URL?, name: String) {
-        guard items.contains(where: { $0.id == id }) else {
-            try? FileManager.default.removeItem(at: Self.partsDir(id))   // deleted meanwhile
-            return
-        }
-        guard let joined else {
-            // Keep the parts: a retry joins them again (e.g. after freeing up space).
-            mutate(id) {
-                $0.state = .failed
-                $0.status = nil
-                $0.error = "Couldn't join the downloaded parts. Check there's enough free space, then tap retry."
-            }
-            notifyFailed(id)
-            startNext()
-            return
-        }
-        let dest = Self.uniqueURL(for: name)
-        do {
-            try FileManager.default.moveItem(at: joined, to: dest)
-            try? FileManager.default.removeItem(at: Self.partsDir(id))
-            finished(id, savedName: dest.lastPathComponent, size: Self.fileSize(dest))
-        } catch {
-            mutate(id) { $0.state = .failed; $0.status = nil; $0.error = error.localizedDescription }
-            notifyFailed(id)
-            startNext()
-        }
-    }
-
-    // MARK: Background
+    // MARK: Leaving and coming back to the app
 
     private func observeAppState() {
         let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: UIApplication.willResignActiveNotification,
+                                            object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.appWillResignActive()
+            }
+        })
         observers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification,
                                             object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -804,34 +1320,143 @@ final class DownloadManager: NSObject, ObservableObject {
                 self.appDidBecomeActive()
             }
         })
+        observers.append(center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification,
+                                            object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.appMemoryWarning()
+            }
+        })
+        observers.append(center.addObserver(forName: UIApplication.willTerminateNotification,
+                                            object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.appWillTerminate()
+            }
+        })
     }
 
     private var waitingForTorBox: [DownloadItem] {
         items.filter { $0.state == .resolving && $0.torboxId != nil && $0.torboxFileId == nil }
     }
 
-    /// Steps that need the app itself running (iOS's download service handles the transfers).
+    /// Steps that need the app itself running for a moment (iOS's downloader handles background transfers).
     private var needsAppTime: Bool {
-        !probing.isEmpty || !merging.isEmpty || items.contains { $0.state == .resolving && $0.torboxId == nil }
+        !probing.isEmpty || !absorbing.isEmpty || items.contains { $0.state == .resolving && $0.torboxId == nil }
     }
 
-    private func appDidEnterBackground() {
-        beginFinishUpTime()
-        let waiting = waitingForTorBox
-        Task {
-            // Replace earlier checks, then let iOS run new ones on schedule while the app sleeps.
-            for task in await checks.allTasks { task.cancel() }
-            for item in waiting {
-                if let webId = item.torboxId { scheduleTorBoxCheck(item.id, webId: webId, after: 20) }
-            }
+    /// Work that keeps JDLite awake in the background: in-app transfers, downloads waiting
+    /// their turn, and links being looked up or fetched by TorBox.
+    private var hasAwakeWork: Bool {
+        !workers.isEmpty || !absorbing.isEmpty || items.contains { $0.state == .queued || $0.state == .resolving }
+    }
+
+    private func appWillResignActive() {
+        if AppSettings.shared.keepAwakeInBackground {
+            // Start staying awake while JDLite is still in front, which iOS always allows.
+            if hasAwakeWork { BackgroundKeeper.shared.start() }
+        } else {
+            // Hand downloads to iOS now, while it still starts them promptly.
+            leaveApp()
         }
     }
 
+    private func appDidEnterBackground() {
+        if inApp {
+            let stayAwake = AppSettings.shared.keepAwakeInBackground && hasAwakeWork && BackgroundKeeper.shared.start()
+            if !stayAwake {
+                BackgroundKeeper.shared.stop()
+                leaveApp()
+            }
+        }
+        beginFinishUpTime()
+        if !BackgroundKeeper.shared.isRunning { scheduleTorBoxChecks() }
+    }
+
     private func appDidBecomeActive() {
+        BackgroundKeeper.shared.stop()
         endFinishUpTime()
+        inApp = true
         Task { for task in await checks.allTasks { task.cancel() } }   // the in-app poller takes over
         if !waitingForTorBox.isEmpty { startTorBoxPolling() }
         startNext()
+        Task { await self.reclaim() }
+    }
+
+    private func appMemoryWarning() {
+        // In the background this can mean iOS is about to close JDLite: let its own downloader take over.
+        guard UIApplication.shared.applicationState == .background, BackgroundKeeper.shared.isRunning else { return }
+        BackgroundKeeper.shared.stop()
+        leaveApp()
+        scheduleTorBoxChecks()
+    }
+
+    private func appWillTerminate() {
+        for id in Array(workers.keys) { turboStop(id) }
+        BackgroundKeeper.shared.stop()
+        save()
+    }
+
+    /// Called when a phone call or another app's audio stops JDLite staying awake.
+    func keeperInterrupted() {
+        guard UIApplication.shared.applicationState == .background else { return }
+        leaveApp()
+        beginFinishUpTime()
+        scheduleTorBoxChecks()
+    }
+
+    /// Hands every running download over to iOS's background downloader.
+    private func leaveApp() {
+        guard inApp else { return }
+        inApp = false
+        for item in items where item.state == .downloading { handOff(item.id) }
+        save()
+    }
+
+    /// Lets JDLite go to sleep once nothing needs it awake in the background.
+    private func refreshKeepAwake() {
+        guard BackgroundKeeper.shared.isRunning, UIApplication.shared.applicationState == .background,
+              !hasAwakeWork else { return }
+        BackgroundKeeper.shared.stop()
+        leaveApp()
+        scheduleTorBoxChecks()
+    }
+
+    private func scheduleKeepAwakeCheck() {
+        guard keepAwakeCheck == nil, BackgroundKeeper.shared.isRunning else { return }
+        keepAwakeCheck = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            self.keepAwakeCheck = nil
+            self.refreshKeepAwake()
+        }
+    }
+
+    /// Back in the app: parts that background transfers had barely started on move to the
+    /// faster in-app connections. Parts that got a good way finish in the background.
+    private func reclaim() async {
+        try? await Task.sleep(nanoseconds: 2_000_000_000)   // let fresh progress come in first
+        guard inApp, UIApplication.shared.applicationState == .active else { return }
+        let ids = Set(items.filter { $0.state == .downloading && !(bgLive[$0.id] ?? []).isEmpty }.map { $0.id })
+        guard !ids.isEmpty else { return }
+        var touched = Set<UUID>()
+        for (task, part) in await liveTasks(for: ids) {
+            guard let part, let tag = Self.parseDesc(task.taskDescription), let i = index(of: tag.id),
+                  items[i].state == .downloading, items[i].singleConnection != true,
+                  let k = items[i].segments?.firstIndex(where: { $0.start == part }) else { continue }
+            let got = max(task.countOfBytesReceived, liveBytes[tag.id]?[part] ?? 0)
+            guard got < Self.reclaimLimit else { continue }
+            task.cancel()
+            bgLive[tag.id]?.remove(part)
+            liveBytes[tag.id]?[part] = nil
+            items[i].segments?[k].background = nil
+            items[i].segments?[k].received = 0
+            items[i].segments?[k].resumeData = nil
+            touched.insert(tag.id)
+        }
+        for id in touched {
+            if let i = index(of: id) { drive(i) }
+        }
+        if !touched.isEmpty { save() }
     }
 
     /// Asks iOS for a little extra time so in-app steps can finish after you leave the app.
@@ -857,6 +1482,18 @@ final class DownloadManager: NSObject, ObservableObject {
         finishUp = .invalid
     }
 
+    private func scheduleTorBoxChecks() {
+        let waiting = waitingForTorBox
+        guard !waiting.isEmpty else { return }
+        Task {
+            // Replace earlier checks, then let iOS run new ones on schedule while the app sleeps.
+            for task in await checks.allTasks { task.cancel() }
+            for item in waiting {
+                if let webId = item.torboxId { scheduleTorBoxCheck(item.id, webId: webId, after: 20) }
+            }
+        }
+    }
+
     /// While the app sleeps, a small background transfer asks TorBox how it's getting on.
     /// iOS runs it around the given time and wakes JDLite with the answer, so once TorBox
     /// has the file, the download starts even with the app closed.
@@ -871,8 +1508,8 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     fileprivate func torboxCheckFinished(_ id: UUID, webId: Int, interval: Int, body: Data?, status: Int) {
-        // While the app is open, the regular poller handles TorBox.
-        guard UIApplication.shared.applicationState == .background,
+        // While the app is open (or kept awake), the regular poller handles TorBox.
+        guard UIApplication.shared.applicationState == .background, !BackgroundKeeper.shared.isRunning,
               let item = items.first(where: { $0.id == id }), item.state == .resolving,
               item.torboxId == webId, item.torboxFileId == nil else { return }
         do {
@@ -900,7 +1537,7 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     fileprivate func torboxCheckFailed(_ id: UUID, webId: Int, interval: Int) {
-        guard UIApplication.shared.applicationState == .background,
+        guard UIApplication.shared.applicationState == .background, !BackgroundKeeper.shared.isRunning,
               let item = items.first(where: { $0.id == id }), item.state == .resolving,
               item.torboxId == webId, item.torboxFileId == nil else { return }
         scheduleTorBoxCheck(id, webId: webId, after: Self.nextCheckDelay(after: interval))
@@ -919,13 +1556,15 @@ final class DownloadManager: NSObject, ObservableObject {
         return (id: id, webId: webId, interval: interval)
     }
 
-    /// iOS cancelled transfers on its own (app swiped away, Background App Refresh off,
-    /// low on resources). Keep their progress and carry on once possible.
-    fileprivate func systemCancelled(_ id: UUID, part: Int?, resumeData: Data?) {
-        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+    /// iOS cancelled background transfers on its own (app swiped away, Background App Refresh
+    /// off, low on resources). Keep their progress and carry on once possible.
+    fileprivate func systemCancelled(_ id: UUID, part: Int64?, resumeData: Data?) {
+        guard let i = index(of: id) else { return }
         if let part {
-            guard let segs = items[i].segments, segs.indices.contains(part), !segs[part].done else { return }
-            items[i].segments?[part].resumeData = resumeData
+            bgLive[id]?.remove(part)
+            guard let k = items[i].segments?.firstIndex(where: { $0.start == part }),
+                  items[i].segments?[k].done == false else { return }
+            items[i].segments?[k].resumeData = resumeData
         } else {
             items[i].resumeData = resumeData
         }
@@ -943,26 +1582,22 @@ final class DownloadManager: NSObject, ObservableObject {
         let ids = pendingRestarts
         pendingRestarts.removeAll()
         let tasks = await liveTasks(for: ids)
-        let active = UIApplication.shared.applicationState == .active
+        let awake = inApp
         for id in ids {
-            guard let i = items.firstIndex(where: { $0.id == id }), items[i].state == .downloading else { continue }
+            guard let i = index(of: id), items[i].state == .downloading else { continue }
             let mine = tasks.filter { Self.parseDesc($0.task.taskDescription)?.id == id }
-            if mine.isEmpty {
+            if mine.isEmpty && workers[id] == nil {
                 // Nothing left running: queue it to carry on from where it stopped.
-                flushProgress(at: i)
+                refreshProgress(at: i)
                 items[i].state = .queued
                 clearTransfer(id)
-            } else if active, let segs = items[i].segments, let request = downloadRequest(for: items[i]) {
-                // Some parts stopped while others kept going: restart just those parts.
-                let liveParts = Set(mine.compactMap { $0.part })
-                for k in segs.indices where !segs[k].done && !liveParts.contains(k) {
-                    launchPart(at: i, part: k, request: request)
-                }
+            } else if awake, items[i].segments != nil {
+                drive(i)   // restart just the parts that stopped
             }
         }
         save()
         // Starting again in the background could just get cancelled again; carry on in the app.
-        if active { startNext() }
+        if awake { startNext() }
     }
 
     private func notifyFailed(_ id: UUID) {
@@ -973,32 +1608,61 @@ final class DownloadManager: NSObject, ObservableObject {
 
     // MARK: Launch
 
+    /// Downloads split by an older version saved each part as its own file; those start again.
+    private func migrateOldParts() {
+        var changed = false
+        for i in items.indices where items[i].segments != nil && items[i].layout != 2 && items[i].state != .completed {
+            try? FileManager.default.removeItem(at: Self.partsDir(items[i].id))
+            items[i].segments = nil
+            items[i].bytesReceived = 0
+            items[i].resumeData = nil
+            if items[i].state == .downloading { items[i].state = .queued }
+            changed = true
+        }
+        if changed { save() }
+    }
+
     private func reconcile() {
         Task {
             // Give iOS a moment to deliver events for transfers that finished while the app was closed.
             try? await Task.sleep(nanoseconds: 1_500_000_000)
-            var live = Set<UUID>()
+            var live: [UUID: Set<Int64>] = [:]
+            var whole = Set<UUID>()
             for lane in lanes {
                 for task in await lane.allTasks {
-                    if let d = Self.parseDesc(task.taskDescription) { live.insert(d.id) }
+                    guard let tag = Self.parseDesc(task.taskDescription) else { continue }
+                    if tag.outdated {
+                        task.cancel()   // a part from an older version; its download starts again
+                    } else if let part = tag.part {
+                        live[tag.id, default: []].insert(part)
+                    } else {
+                        whole.insert(tag.id)
+                    }
                 }
             }
+            for (id, parts) in live { bgLive[id, default: []].formUnion(parts) }
             var toResolve: [UUID] = []
-            var toJoin: [UUID] = []
+            var toDrive: [UUID] = []
             for i in items.indices {
-                let it = items[i]
-                if it.state == .downloading {
-                    if let segs = it.segments, !segs.isEmpty, segs.allSatisfy({ $0.done }) {
-                        toJoin.append(it.id)
-                    } else if !live.contains(it.id) {
+                let item = items[i]
+                if item.state == .downloading, workers[item.id] == nil {
+                    if item.segments != nil {
+                        if (bgLive[item.id] ?? []).isEmpty {
+                            items[i].state = .queued
+                        } else {
+                            toDrive.append(item.id)
+                        }
+                    } else if !whole.contains(item.id), !probing.contains(item.id) {
                         items[i].state = .queued
                     }
                 }
-                if it.state == .resolving { toResolve.append(it.id) }
+                if item.state == .resolving { toResolve.append(item.id) }
             }
             save()
             for id in toResolve { Task { await self.runResolve(id) } }
-            for id in toJoin { merge(id) }
+            for id in toDrive {
+                if let i = index(of: id) { drive(i) }
+            }
             startNext()
         }
     }
@@ -1007,6 +1671,10 @@ final class DownloadManager: NSObject, ObservableObject {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         body(&items[i])
         if persist { save() }
+    }
+
+    private func index(of id: UUID) -> Int? {
+        items.firstIndex { $0.id == id }
     }
 
     fileprivate func finishEvents(for identifier: String?) {
@@ -1019,39 +1687,89 @@ final class DownloadManager: NSObject, ObservableObject {
 
     fileprivate func advance() { startNext() }
 
-    // MARK: Transfer updates (called from the URLSession delegate)
+    // MARK: Progress
 
-    fileprivate func noteProgress(_ id: UUID, part: Int?, written: Int64, expected: Int64) {
+    private func ensureProgressLoop() {
+        guard progressLoop == nil else { return }
+        progressLoop = Task {
+            while !self.workers.isEmpty {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                self.tick()
+            }
+            self.progressLoop = nil
+            self.updateConnectionCounts()
+        }
+    }
+
+    /// Twice a second while in-app connections run: progress, speed, and now and then a save.
+    private func tick() {
+        let now = ProcessInfo.processInfo.systemUptime
+        for id in Array(workers.keys) {
+            guard let i = index(of: id), items[i].state == .downloading else { continue }
+            refreshProgress(at: i)
+            updateSpeed(id, total: items[i].bytesReceived, now: now)
+        }
+        updateConnectionCounts()
+        if now - lastSave >= 5 { save() }
+    }
+
+    /// Background transfer progress (called from the URLSession delegate).
+    fileprivate func noteProgress(_ id: UUID, part: Int64?, written: Int64, expected: Int64) {
         if let part { liveBytes[id, default: [:]][part] = written }
+        if workers[id] != nil { return }   // the in-app progress loop updates this download
         let now = ProcessInfo.processInfo.systemUptime
         if let last = samples[id], now - last.time < 0.5 { return }   // at most two screen updates a second
-        guard let i = items.firstIndex(where: { $0.id == id }), items[i].state == .downloading else { return }
+        guard let i = index(of: id), items[i].state == .downloading else { return }
         if part != nil {
-            flushProgress(at: i)
+            refreshProgress(at: i)
         } else {
             items[i].bytesReceived = written
             if expected > 0 { items[i].bytesTotal = expected }
         }
-        let total = items[i].bytesReceived
-        if let last = samples[id] {
+        updateSpeed(id, total: items[i].bytesReceived, now: now)
+    }
+
+    /// Adds up a download's progress: finished parts, bytes in-app connections have written,
+    /// and what background transfers have fetched so far.
+    private func refreshProgress(at i: Int) {
+        guard var segs = items[i].segments else { return }
+        let id = items[i].id
+        var unsynced: Int64 = 0
+        for worker in workers[id] ?? [] {
+            guard let snap = worker.snapshot, let k = segs.firstIndex(where: { $0.start == snap.part }),
+                  !segs[k].done else { continue }
+            let cap = segs[k].end == TurboWorker.unknownEnd ? Int64.max : segs[k].length
+            segs[k].received = min(max(snap.synced - snap.part, 0), cap)
+            unsynced += max(0, min(snap.written - snap.part, cap) - segs[k].received)
+        }
+        for (start, bytes) in liveBytes[id] ?? [:] {
+            guard let k = segs.firstIndex(where: { $0.start == start }), !segs[k].done,
+                  segs[k].background == true else { continue }
+            segs[k].received = min(bytes, segs[k].length)
+        }
+        items[i].segments = segs
+        items[i].bytesReceived = segs.reduce(Int64(0)) { $0 + ($1.done ? $1.length : $1.received) } + unsynced
+    }
+
+    private func refreshProgress(_ id: UUID) {
+        if let i = index(of: id) { refreshProgress(at: i) }
+    }
+
+    private func updateSpeed(_ id: UUID, total: Int64, now: TimeInterval) {
+        if let last = samples[id], now > last.time {
             let instant = max(0, Double(total - last.bytes) / (now - last.time))
             speeds[id] = speeds[id].map { $0 * 0.6 + instant * 0.4 } ?? instant
         }
         samples[id] = (time: now, bytes: total)
     }
 
-    /// Copies per-part progress into the item and updates its total.
-    private func flushProgress(at i: Int) {
-        guard var segs = items[i].segments else { return }
-        for (k, bytes) in liveBytes[items[i].id] ?? [:] where segs.indices.contains(k) && !segs[k].done {
-            segs[k].received = min(bytes, segs[k].length)
+    private func updateConnectionCounts() {
+        var counts: [UUID: Int] = [:]
+        for item in items where item.state == .downloading {
+            let n = connectionsInUse(item.id)
+            if n > 0 { counts[item.id] = n }
         }
-        items[i].segments = segs
-        items[i].bytesReceived = segs.reduce(Int64(0)) { $0 + ($1.done ? $1.length : $1.received) }
-    }
-
-    private func flushProgress(_ id: UUID) {
-        if let i = items.firstIndex(where: { $0.id == id }) { flushProgress(at: i) }
+        if counts != connectionCounts { connectionCounts = counts }
     }
 
     fileprivate func clearTransfer(_ id: UUID) {
@@ -1062,6 +1780,14 @@ final class DownloadManager: NSObject, ObservableObject {
     fileprivate func finished(_ id: UUID, savedName: String, size: Int64) {
         clearTransfer(id)
         liveBytes[id] = nil
+        bgLive[id] = nil
+        directURLs[id] = nil
+        workerLimit[id] = nil
+        jsonReplies.remove(id)
+        clearAttempts(id)
+        if let list = workers.removeValue(forKey: id) {
+            for worker in list { worker.stop() }
+        }
         guard items.contains(where: { $0.id == id }) else {
             // Deleted while it was finishing: don't leave the file behind.
             try? FileManager.default.removeItem(at: Self.downloadsDir.appendingPathComponent(savedName))
@@ -1077,13 +1803,14 @@ final class DownloadManager: NSObject, ObservableObject {
             $0.error = nil
             $0.status = nil
             $0.segments = nil
-            $0.mergedThrough = nil
+            $0.layout = nil
         }
         if let item = items.first(where: { $0.id == id }) { Notifier.shared.finished(item) }
         startNext()
     }
 
     fileprivate func downloadFailed(_ id: UUID, message: String) {
+        turboStop(id)
         clearTransfer(id)
         mutate(id) {
             $0.state = .failed
@@ -1100,7 +1827,10 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     fileprivate func gotWebPage(_ id: UUID) {
+        turboStop(id)
         clearTransfer(id)
+        bgLive[id] = nil
+        try? FileManager.default.removeItem(at: Self.partsDir(id))
         let hint: String
         if TorBox.shared.isActive {
             hint = "TorBox doesn't list this site as supported."
@@ -1112,6 +1842,9 @@ final class DownloadManager: NSObject, ObservableObject {
         mutate(id) {
             $0.state = .failed
             $0.resumeData = nil
+            $0.segments = nil
+            $0.layout = nil
+            $0.bytesReceived = 0
             $0.error = "Got a web page instead of a file. " + hint
             if $0.torboxFileId == nil {
                 if let source = $0.sourceURL { $0.url = source }
@@ -1126,7 +1859,10 @@ final class DownloadManager: NSObject, ObservableObject {
     // MARK: Persistence
 
     private func save() {
+        lastSave = ProcessInfo.processInfo.systemUptime
         if let d = try? JSONEncoder().encode(items) { try? d.write(to: storeURL, options: .atomic) }
+        updateConnectionCounts()
+        scheduleKeepAwakeCheck()
     }
 
     private func load() {
@@ -1136,21 +1872,30 @@ final class DownloadManager: NSObject, ObservableObject {
 
     // MARK: Files
 
-    /// Task description: "<id>\n<file name>" plus "\n<part>\n<part length>" for parts.
-    nonisolated static func describe(_ id: UUID, name: String?, part: Int?, length: Int64?) -> String {
+    /// Task description: "<id>\n<file name>", plus "\n@<part start>\n<part length>" for a part.
+    nonisolated static func describe(_ id: UUID, name: String?, part: Int64?, length: Int64?) -> String {
         var s = id.uuidString + "\n" + (name ?? "")
-        if let part { s += "\n\(part)\n\(length ?? 0)" }
+        if let part { s += "\n@\(part)\n\(length ?? 0)" }
         return s
     }
 
-    nonisolated static func parseDesc(_ s: String?) -> (id: UUID, name: String?, part: Int?, length: Int64?)? {
+    nonisolated static func parseDesc(_ s: String?) -> TransferTag? {
         guard let s else { return nil }
         let lines = s.components(separatedBy: "\n")
         guard let first = lines.first, let id = UUID(uuidString: first) else { return nil }
         let name = lines.count > 1 && !lines[1].isEmpty ? lines[1] : nil
-        let part = lines.count > 2 ? Int(lines[2]) : nil
+        var part: Int64?
+        var outdated = false
+        if lines.count > 2 {
+            if lines[2].hasPrefix("@") {
+                part = Int64(lines[2].dropFirst())
+                outdated = part == nil
+            } else {
+                outdated = true   // older versions numbered their parts
+            }
+        }
         let length = lines.count > 3 ? Int64(lines[3]) : nil
-        return (id: id, name: name, part: part, length: length)
+        return TransferTag(id: id, name: name, part: part, length: length, outdated: outdated)
     }
 
     nonisolated static func cleanName(_ name: String) -> String {
@@ -1175,8 +1920,67 @@ final class DownloadManager: NSObject, ObservableObject {
         partsRoot.appendingPathComponent(id.uuidString, isDirectory: true)
     }
 
-    nonisolated static func partURL(_ id: UUID, _ k: Int) -> URL {
-        partsDir(id).appendingPathComponent("\(k).part")
+    /// The file a download's bytes are written into while it downloads.
+    nonisolated static func dataURL(_ id: UUID) -> URL {
+        partsDir(id).appendingPathComponent("data")
+    }
+
+    /// A part that arrived through a background transfer, waiting to be copied into the data file.
+    nonisolated static func partURL(_ id: UUID, _ start: Int64) -> URL {
+        partsDir(id).appendingPathComponent("\(start).part")
+    }
+
+    nonisolated static func partKey(_ id: UUID, _ start: Int64) -> String {
+        "\(id.uuidString)/\(start)"
+    }
+
+    nonisolated static func partReady(_ id: UUID, _ seg: Segment) -> Bool {
+        let url = partURL(id, seg.start)
+        return FileManager.default.fileExists(atPath: url.path) && fileSize(url) >= seg.length
+    }
+
+    nonisolated private static let fileQueue = DispatchQueue(label: "com.codeymoore.jdlite.parts", qos: .utility)
+
+    /// Copies a finished background part into the data file, off the main thread.
+    nonisolated static func absorbPart(_ id: UUID, start: Int64, length: Int64) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            DownloadManager.fileQueue.async {
+                continuation.resume(returning: DownloadManager.copyPart(id, start: start, length: length))
+            }
+        }
+    }
+
+    nonisolated static func copyPart(_ id: UUID, start: Int64, length: Int64) -> Bool {
+        let fm = FileManager.default
+        let part = partURL(id, start)
+        let data = dataURL(id)
+        guard fm.fileExists(atPath: part.path) else { return false }
+        if start == 0, !fm.fileExists(atPath: data.path), (try? fm.moveItem(at: part, to: data)) != nil {
+            return true   // nothing saved yet: the part simply becomes the data file
+        }
+        ensureFileExists(data)
+        guard let output = try? FileHandle(forWritingTo: data),
+              let input = try? FileHandle(forReadingFrom: part) else { return false }
+        defer {
+            try? output.close()
+            try? input.close()
+        }
+        do {
+            try output.seek(toOffset: UInt64(start))
+            var left = length
+            while left > 0 {
+                guard let chunk = try input.read(upToCount: Int(min(left, 4 << 20))), !chunk.isEmpty else {
+                    return false
+                }
+                try output.write(contentsOf: chunk)
+                left -= Int64(chunk.count)
+            }
+            try output.synchronize()
+        } catch {
+            return false
+        }
+        try? fm.removeItem(at: part)
+        return true
     }
 
     /// Parts are temporary, so keep them out of iCloud backups.
@@ -1219,15 +2023,16 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 }
 
-// MARK: - URLSession delegate (runs off the main actor)
+// MARK: - Background URLSession delegate (runs off the main actor)
 
 extension DownloadManager: URLSessionDownloadDelegate {
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                                 didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                                 totalBytesExpectedToWrite: Int64) {
-        guard downloadTask.state == .running, let d = Self.parseDesc(downloadTask.taskDescription) else { return }
-        let id = d.id
-        if let part = d.part, let length = d.length, length > 0,
+        guard downloadTask.state == .running, let tag = Self.parseDesc(downloadTask.taskDescription),
+              !tag.outdated else { return }
+        let id = tag.id
+        if let part = tag.part, let length = tag.length, length > 0,
            totalBytesExpectedToWrite > 0, totalBytesExpectedToWrite != length {
             // Not the byte range we asked for: stop it before it wastes data.
             downloadTask.cancel()
@@ -1235,18 +2040,19 @@ extension DownloadManager: URLSessionDownloadDelegate {
             Task { @MainActor in self.partMismatch(id, part: part, rangesIgnored: status == 200) }
             return
         }
+        let part = tag.part
         Task { @MainActor in
-            self.noteProgress(id, part: d.part, written: totalBytesWritten, expected: totalBytesExpectedToWrite)
+            self.noteProgress(id, part: part, written: totalBytesWritten, expected: totalBytesExpectedToWrite)
         }
     }
 
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                                 didResumeAtOffset fileOffset: Int64, expectedTotalBytes: Int64) {
         // A resumed part must still add up to exactly its byte range; otherwise start it over.
-        guard let d = Self.parseDesc(downloadTask.taskDescription), let part = d.part,
-              let length = d.length, length > 0, expectedTotalBytes != length else { return }
+        guard let tag = Self.parseDesc(downloadTask.taskDescription), !tag.outdated, let part = tag.part,
+              let length = tag.length, length > 0, expectedTotalBytes != length else { return }
         downloadTask.cancel()
-        let id = d.id
+        let id = tag.id
         Task { @MainActor in self.partMismatch(id, part: part, rangesIgnored: false) }
     }
 
@@ -1262,17 +2068,18 @@ extension DownloadManager: URLSessionDownloadDelegate {
             }
             return
         }
-        guard let d = Self.parseDesc(downloadTask.taskDescription) else { return }
-        let id = d.id
+        guard let tag = Self.parseDesc(downloadTask.taskDescription), !tag.outdated else { return }
+        let id = tag.id
         let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
         let mime = downloadTask.response?.mimeType?.lowercased() ?? ""
 
-        if let part = d.part {
+        if let part = tag.part {
             // Keep the part (the temp file is deleted when this method returns).
             let dest = Self.partURL(id, part)
             var moved = false
             do {
-                try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true)
                 try? FileManager.default.removeItem(at: dest)
                 try FileManager.default.moveItem(at: location, to: dest)
                 moved = true
@@ -1305,8 +2112,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         }
 
         // The temp file is deleted when this method returns, so move it now.
-        let hint = (d.name?.isEmpty == false) ? d.name : nil
-        let name = Self.cleanName(hint ?? downloadTask.response?.suggestedFilename ?? "download")
+        let name = Self.cleanName(tag.name ?? downloadTask.response?.suggestedFilename ?? "download")
         let dest = Self.uniqueURL(for: name)
         do {
             try FileManager.default.moveItem(at: location, to: dest)
@@ -1332,20 +2138,21 @@ extension DownloadManager: URLSessionDownloadDelegate {
             }
             return
         }
-        guard let d = Self.parseDesc(task.taskDescription) else { return }
-        let id = d.id
+        guard let tag = Self.parseDesc(task.taskDescription), !tag.outdated else { return }
+        let id = tag.id
+        let part = tag.part
         let data = ns.userInfo[NSURLSessionDownloadTaskResumeData] as? Data
         if ns.code == NSURLErrorCancelled {
             // Our own pause/delete cancels are handled where they happen. iOS also cancels
             // transfers itself (app swiped away, Background App Refresh off, low on
             // resources): keep their progress so they carry on later.
             if ns.userInfo[NSURLErrorBackgroundTaskCancelledReasonKey] != nil {
-                Task { @MainActor in self.systemCancelled(id, part: d.part, resumeData: data) }
+                Task { @MainActor in self.systemCancelled(id, part: part, resumeData: data) }
             }
             return
         }
         let msg = error.localizedDescription
-        if let part = d.part {
+        if let part {
             Task { @MainActor in self.partFailed(id, part: part, message: msg, resumeData: data) }
             return
         }

@@ -182,6 +182,17 @@ final class TorBox: ObservableObject {
         return try Self.parseWebDownload(data, id: id)
     }
 
+    /// The status of every web download on the account, by ID: one request for many links.
+    func webDownloadList() async throws -> [Int: TorBoxWebDownload] {
+        let data = try await call("GET", "webdl/mylist", query: [URLQueryItem(name: "bypass_cache", value: "true")])
+        var out: [Int: TorBoxWebDownload] = [:]
+        for entry in (data as? [[String: Any]]) ?? [] {
+            guard let id = Self.int(entry["id"]), let dl = try? Self.parseWebDownload(entry, id: id) else { continue }
+            out[id] = dl
+        }
+        return out
+    }
+
     /// The same status request as a plain URLRequest, for background checks while the app sleeps.
     func statusRequest(webId: Int) -> URLRequest? {
         guard let key else { return nil }

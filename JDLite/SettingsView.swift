@@ -9,7 +9,7 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
-                    Stepper(value: $settings.connectionsPerDownload, in: 1...8) {
+                    Stepper(value: $settings.connectionsPerDownload, in: 1...AppSettings.maxConnections) {
                         LabeledContent("Connections per file", value: "\(settings.connectionsPerDownload)")
                     }
                     Stepper(value: $settings.simultaneousDownloads, in: 1...6) {
@@ -18,9 +18,10 @@ struct SettingsView: View {
                 } header: {
                     Text("Speed")
                 } footer: {
-                    Text("Large files are split into parts that download over separate connections at the same time, which is usually much faster, especially from servers far away. Applies to downloads that start after you change it. Set it to 1 if a site has problems with it.")
+                    Text("Each file downloads over several connections at once, straight into place. When a connection finishes its share, it takes over half of the slowest one's, so every connection stays busy to the end. More connections are usually faster; set it to 1 if a site has problems with it.")
                 }
                 Section {
+                    Toggle("Full Speed in Background", isOn: $settings.keepAwakeInBackground)
                     Toggle("Notify When Done", isOn: $settings.notificationsEnabled)
                     LabeledContent("Background App Refresh", value: system.backgroundRefreshOn ? "On" : "Off")
                     if !system.backgroundRefreshOn {
@@ -29,7 +30,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Background")
                 } footer: {
-                    Text("Downloads keep going while JDLite is closed, and files TorBox is still fetching are checked every few minutes. You'll get a notification when a download finishes or fails. Swiping JDLite away in the app switcher stops its downloads until you open it again; they then carry on from where they stopped.")
+                    Text("Full Speed in Background keeps JDLite running while it downloads after you leave it (it plays silence to stay awake, like a music app), so downloads don't slow down. It uses a little more battery and stops by itself when downloads finish. When it's off, iOS's own background downloader takes over, which is often much slower.\n\nYou'll get a notification when a download finishes or fails. Swiping JDLite away in the app switcher stops its downloads until you open it again; they then carry on from where they stopped.")
                 }
                 Section {
                     Toggle("Live Activity", isOn: $settings.liveActivityEnabled)
