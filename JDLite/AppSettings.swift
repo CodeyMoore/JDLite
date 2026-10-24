@@ -21,6 +21,14 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    /// Notify when downloads finish or fail while the app isn't open.
+    @Published var notificationsEnabled: Bool {
+        didSet {
+            defaults.set(notificationsEnabled, forKey: "notificationsEnabled")
+            if notificationsEnabled { Notifier.shared.askPermissionIfNeeded() }
+        }
+    }
+
     @Published var liveActivityEnabled: Bool {
         didSet {
             defaults.set(liveActivityEnabled, forKey: "liveActivityEnabled")
@@ -32,6 +40,7 @@ final class AppSettings: ObservableObject {
         let d = UserDefaults.standard
         _connectionsPerDownload = Published(wrappedValue: d.object(forKey: "connectionsPerDownload") as? Int ?? 4)
         _simultaneousDownloads = Published(wrappedValue: d.object(forKey: "simultaneousDownloads") as? Int ?? 3)
+        _notificationsEnabled = Published(wrappedValue: d.object(forKey: "notificationsEnabled") as? Bool ?? true)
         _liveActivityEnabled = Published(wrappedValue: d.object(forKey: "liveActivityEnabled") as? Bool ?? true)
     }
 }

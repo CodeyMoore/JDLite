@@ -8,14 +8,39 @@ struct ContentView: View {
     }
 
     @EnvironmentObject var manager: DownloadManager
+    @ObservedObject private var system = SystemStatus.shared
     @State private var sheet: Sheet?
     @State private var editMode: EditMode = .inactive
     @State private var selection = Set<UUID>()
     @State private var pendingDelete = Set<UUID>()
     @State private var confirmingDelete = false
+    @AppStorage("sortOrder") private var sortOrder: SortOrder = .oldest
+    @AppStorage("statusFilter") private var statusFilter: StatusFilter = .all
+    @AppStorage("typeFilter") private var typeFilter: String = "all"
 
     private var isEditing: Bool { editMode.isEditing }
-    private var allSelected: Bool { !manager.items.isEmpty && selection.count == manager.items.count }
+    private var isFiltering: Bool { statusFilter != .all || typeFilter != "all" }
+
+    /// The downloads after the filter, sorted by when they were added.
+    private var visibleItems: [DownloadItem] {
+        let filtered = manager.items.enumerated().filter { pair in
+            statusFilter.matches(pair.element)
+                && (typeFilter == "all" || FileKind.of(pair.element.fileName).rawValue == typeFilter)
+        }
+        let newestFirst = sortOrder == .newest
+        return filtered.sorted { a, b in
+            let da = a.element.addedAt ?? .distantPast
+            let db = b.element.addedAt ?? .distantPast
+            if da != db { return newestFirst ? da > db : da < db }
+            return newestFirst ? a.offset > b.offset : a.offset < b.offset
+        }
+        .map { $0.element }
+    }
+
+    private var allSelected: Bool {
+        let ids = Set(visibleItems.map(\.id))
+        return !ids.isEmpty && ids.isSubset(of: selection)
+    }
 
     var body: some View {
         NavigationStack {
@@ -25,8 +50,15 @@ struct ContentView: View {
                                            systemImage: "arrow.down.circle",
                                            description: Text("Tap + to paste links, or send them from Safari."))
                 } else {
+                    let visible = visibleItems
                     List(selection: $selection) {
-                        ForEach(manager.items) { item in
+                        if !isEditing && !system.backgroundRefreshOn {
+                            BackgroundWarning(lowPower: system.lowPowerMode) { system.openAppSettings() }
+                        }
+                        if !isEditing && isFiltering && !visible.isEmpty {
+                            FilterSummary(text: filterSummary, count: visible.count) { clearFilters() }
+                        }
+                        ForEach(visible) { item in
                             DownloadRow(item: item, speed: manager.speeds[item.id])
                                 .tag(item.id)
                                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
@@ -40,6 +72,17 @@ struct ContentView: View {
                         }
                     }
                     .listStyle(.plain)
+                    .overlay {
+                        if visible.isEmpty {
+                            ContentUnavailableView {
+                                Label("No matching downloads", systemImage: "line.3.horizontal.decrease.circle")
+                            } description: {
+                                Text("Nothing matches the filter you picked.")
+                            } actions: {
+                                Button("Show Everything") { clearFilters() }
+                            }
+                        }
+                    }
                 }
             }
             .environment(\.editMode, $editMode)
@@ -74,7 +117,7 @@ struct ContentView: View {
         if isEditing {
             ToolbarItem(placement: .topBarLeading) {
                 Button(allSelected ? "Deselect All" : "Select All") {
-                    selection = allSelected ? [] : Set(manager.items.map(\.id))
+                    selection = allSelected ? [] : Set(visibleItems.map(\.id))
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
@@ -107,11 +150,80 @@ struct ContentView: View {
                     Image(systemName: "ellipsis.circle")
                 }
             }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                filterMenu
                 Button { sheet = .add } label: { Image(systemName: "plus") }
             }
         }
     }
+
+    // MARK: Filter menu
+
+    private var filterMenu: some View {
+        Menu {
+            Section("Sort") {
+                Picker("Sort", selection: $sortOrder) {
+                    Label("Newest First", systemImage: "arrow.down").tag(SortOrder.newest)
+                    Label("Oldest First", systemImage: "arrow.up").tag(SortOrder.oldest)
+                }
+                .pickerStyle(.inline)
+            }
+            Section("Show") {
+                Picker("Show", selection: $statusFilter) {
+                    ForEach(StatusFilter.allCases, id: \.self) { filter in
+                        Label("\(filter.title) (\(count(filter)))", systemImage: filter.symbol).tag(filter)
+                    }
+                }
+                .pickerStyle(.inline)
+            }
+            Section("File Type") {
+                Picker(selection: $typeFilter) {
+                    Label("All Types", systemImage: "square.grid.2x2").tag("all")
+                    ForEach(kindsInList) { kind in
+                        Label("\(kind.title) (\(count(kind)))", systemImage: kind.symbol).tag(kind.rawValue)
+                    }
+                } label: {
+                    Label(FileKind(rawValue: typeFilter)?.title ?? "File Type", systemImage: "doc.on.doc")
+                }
+                .pickerStyle(.menu)
+            }
+            if isFiltering {
+                Button("Show Everything", systemImage: "xmark.circle") { clearFilters() }
+            }
+        } label: {
+            Image(systemName: isFiltering ? "line.3.horizontal.decrease.circle.fill"
+                                          : "line.3.horizontal.decrease.circle")
+        }
+        .accessibilityLabel("Sort and filter")
+    }
+
+    /// File types present in the list (plus the chosen one, so its checkmark shows).
+    private var kindsInList: [FileKind] {
+        let present = Set(manager.items.map { FileKind.of($0.fileName) })
+        return FileKind.allCases.filter { present.contains($0) || $0.rawValue == typeFilter }
+    }
+
+    private func count(_ filter: StatusFilter) -> Int {
+        manager.items.filter { filter.matches($0) }.count
+    }
+
+    private func count(_ kind: FileKind) -> Int {
+        manager.items.filter { FileKind.of($0.fileName) == kind }.count
+    }
+
+    private var filterSummary: String {
+        var parts: [String] = []
+        if statusFilter != .all { parts.append(statusFilter.title) }
+        if let kind = FileKind(rawValue: typeFilter) { parts.append(kind.title) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func clearFilters() {
+        statusFilter = .all
+        typeFilter = "all"
+    }
+
+    // MARK: Deleting
 
     private func askToDelete(_ ids: Set<UUID>) {
         guard !ids.isEmpty else { return }
@@ -138,6 +250,53 @@ struct ContentView: View {
         if finished == items.count { return "Their files will be deleted from this device." }
         if finished == 0 { return "These downloads will stop and anything downloaded so far will be deleted." }
         return "Finished files will be deleted from this device, and unfinished downloads will stop."
+    }
+}
+
+/// Shown when iOS won't let downloads carry on in the background.
+private struct BackgroundWarning: View {
+    let lowPower: Bool
+    let openSettings: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Background App Refresh is off")
+                    .font(.subheadline.weight(.semibold))
+                Text(lowPower
+                     ? "Low Power Mode turns it off, so downloads may stop when you leave JDLite."
+                     : "Downloads may stop when you leave JDLite. Turn on Background App Refresh to keep them going.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if !lowPower {
+                    Button("Open Settings", action: openSettings)
+                        .font(.caption.weight(.semibold))
+                        .buttonStyle(.borderless)
+                }
+            }
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+/// A reminder that the list is filtered, with a quick way back.
+private struct FilterSummary: View {
+    let text: String
+    let count: Int
+    let clear: () -> Void
+
+    var body: some View {
+        HStack {
+            Label("\(text) · \(count)", systemImage: "line.3.horizontal.decrease")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Clear", action: clear)
+                .font(.footnote.weight(.semibold))
+                .buttonStyle(.borderless)
+        }
     }
 }
 
@@ -469,20 +628,7 @@ struct FileBadge: View {
     }
 
     static func symbol(for name: String) -> String {
-        let lower = name.lowercased()
-        if lower.range(of: #"\.(r\d{2}|z\d{2}|\d{3})$"#, options: .regularExpression) != nil { return "doc.zipper" }
-        switch (lower as NSString).pathExtension {
-        case "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "cab": return "doc.zipper"
-        case "mp4", "m4v", "mkv", "mov", "avi", "webm", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg", "3gp": return "film"
-        case "mp3", "m4a", "m4b", "aac", "flac", "wav", "ogg", "opus", "wma", "aiff", "ape": return "music.note"
-        case "pdf": return "doc.richtext"
-        case "epub", "mobi", "azw", "azw3", "cbz", "cbr", "djvu": return "book.closed"
-        case "ipa", "tipa", "apk", "xapk", "deb", "dmg", "pkg", "exe", "msi", "appimage", "rpm": return "app.badge"
-        case "iso", "img", "bin", "cue": return "opticaldiscdrive"
-        case "jpg", "jpeg", "png", "gif", "webp", "heic", "avif": return "photo"
-        case "srt", "ass", "ssa", "sub": return "captions.bubble"
-        default: return "doc"
-        }
+        FileKind.of(name).symbol
     }
 }
 

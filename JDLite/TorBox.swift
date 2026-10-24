@@ -179,6 +179,38 @@ final class TorBox: ObservableObject {
             URLQueryItem(name: "id", value: String(id)),
             URLQueryItem(name: "bypass_cache", value: "true")
         ])
+        return try Self.parseWebDownload(data, id: id)
+    }
+
+    /// The same status request as a plain URLRequest, for background checks while the app sleeps.
+    func statusRequest(webId: Int) -> URLRequest? {
+        guard let key else { return nil }
+        var comps = URLComponents(string: Self.base + "webdl/mylist")
+        comps?.queryItems = [
+            URLQueryItem(name: "id", value: String(webId)),
+            URLQueryItem(name: "bypass_cache", value: "true")
+        ]
+        guard let url = comps?.url else { return nil }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        return req
+    }
+
+    /// Reads a whole status reply (as delivered to a background check).
+    static func parseStatus(_ body: Data, id: Int) throws -> TorBoxWebDownload {
+        guard let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
+            throw TorBoxError.api("Unexpected reply from TorBox.")
+        }
+        if (json["success"] as? Bool) == false {
+            let detail = (json["detail"] as? String) ?? (json["error"] as? String) ?? "TorBox returned an error."
+            throw TorBoxError.api(detail)
+        }
+        let payload = json["data"]
+        return try parseWebDownload(payload is NSNull ? nil : payload, id: id)
+    }
+
+    private static func parseWebDownload(_ data: Any?, id: Int) throws -> TorBoxWebDownload {
         var object = data as? [String: Any]
         if object == nil, let list = data as? [[String: Any]] {
             object = list.first { Self.int($0["id"]) == id }

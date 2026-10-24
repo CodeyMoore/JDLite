@@ -68,6 +68,14 @@ final class DownloadManager: NSObject, ObservableObject {
     private var liveBytes: [UUID: [Int: Int64]] = [:]   // per-part progress not yet copied into items
     private var merging = Set<UUID>()
     private var backgroundTime: [UUID: UIBackgroundTaskIdentifier] = [:]
+    /// Background session for TorBox status checks while the app is asleep.
+    private var checks: URLSession!
+    nonisolated private static let checkPrefix = "torbox-check"
+    private var probing = Set<UUID>()
+    private var finishUp: UIBackgroundTaskIdentifier = .invalid
+    private var pendingRestarts = Set<UUID>()
+    private var restartTask: Task<Void, Never>?
+    private var observers: [NSObjectProtocol] = []
     private let storeURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -88,6 +96,11 @@ final class DownloadManager: NSObject, ObservableObject {
             cfg.httpMaximumConnectionsPerHost = 6
             lanes.append(URLSession(configuration: cfg, delegate: self, delegateQueue: nil))
         }
+        let checkConfig = URLSessionConfiguration.background(withIdentifier: "\(base).checks")
+        checkConfig.sessionSendsLaunchEvents = true
+        checkConfig.isDiscretionary = false
+        checks = URLSession(configuration: checkConfig, delegate: self, delegateQueue: nil)
+        observeAppState()
         reconcile()
     }
 
@@ -107,6 +120,7 @@ final class DownloadManager: NSObject, ObservableObject {
             ids.append(item.id)
         }
         save()
+        if !ids.isEmpty { Notifier.shared.askPermissionIfNeeded() }
         for id in ids { Task { await runResolve(id) } }
     }
 
@@ -373,6 +387,7 @@ final class DownloadManager: NSObject, ObservableObject {
     private func failResolve(_ id: UUID, _ message: String) {
         guard isResolving(id) else { return }   // paused or removed meanwhile
         mutate(id) { $0.state = .failed; $0.error = message; $0.status = nil }
+        notifyFailed(id)
     }
 
     // MARK: Queue
@@ -515,6 +530,9 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// Splits a new download into parts if the server allows it, else uses one connection.
     private func split(_ id: UUID, request: URLRequest) async {
+        probing.insert(id)
+        defer { probing.remove(id) }
+        if UIApplication.shared.applicationState == .background { beginFinishUpTime() }
         let probe = await Self.probe(request)
         guard let i = items.firstIndex(where: { $0.id == id }), items[i].state == .downloading,
               items[i].segments == nil else { return }   // paused or deleted meanwhile
@@ -650,6 +668,7 @@ final class DownloadManager: NSObject, ObservableObject {
     private func failSplit(_ id: UUID, message: String) {
         flushProgress(id)
         mutate(id) { $0.state = .failed; $0.error = message; $0.status = nil }
+        notifyFailed(id)
         clearTransfer(id)
         startNext()
         Task { await stopTransfers(for: id) }
@@ -751,6 +770,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 $0.status = nil
                 $0.error = "Couldn't join the downloaded parts. Check there's enough free space, then tap retry."
             }
+            notifyFailed(id)
             startNext()
             return
         }
@@ -761,7 +781,193 @@ final class DownloadManager: NSObject, ObservableObject {
             finished(id, savedName: dest.lastPathComponent, size: Self.fileSize(dest))
         } catch {
             mutate(id) { $0.state = .failed; $0.status = nil; $0.error = error.localizedDescription }
+            notifyFailed(id)
             startNext()
+        }
+    }
+
+    // MARK: Background
+
+    private func observeAppState() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                            object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.appDidEnterBackground()
+            }
+        })
+        observers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                            object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.appDidBecomeActive()
+            }
+        })
+    }
+
+    private var waitingForTorBox: [DownloadItem] {
+        items.filter { $0.state == .resolving && $0.torboxId != nil && $0.torboxFileId == nil }
+    }
+
+    /// Steps that need the app itself running (iOS's download service handles the transfers).
+    private var needsAppTime: Bool {
+        !probing.isEmpty || !merging.isEmpty || items.contains { $0.state == .resolving && $0.torboxId == nil }
+    }
+
+    private func appDidEnterBackground() {
+        beginFinishUpTime()
+        let waiting = waitingForTorBox
+        Task {
+            // Replace earlier checks, then let iOS run new ones on schedule while the app sleeps.
+            for task in await checks.allTasks { task.cancel() }
+            for item in waiting {
+                if let webId = item.torboxId { scheduleTorBoxCheck(item.id, webId: webId, after: 20) }
+            }
+        }
+    }
+
+    private func appDidBecomeActive() {
+        endFinishUpTime()
+        Task { for task in await checks.allTasks { task.cancel() } }   // the in-app poller takes over
+        if !waitingForTorBox.isEmpty { startTorBoxPolling() }
+        startNext()
+    }
+
+    /// Asks iOS for a little extra time so in-app steps can finish after you leave the app.
+    private func beginFinishUpTime() {
+        guard finishUp == .invalid, needsAppTime || !waitingForTorBox.isEmpty else { return }
+        finishUp = UIApplication.shared.beginBackgroundTask(withName: "Finish up") { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.endFinishUpTime()
+            }
+        }
+        Task {
+            repeat {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            } while self.finishUp != .invalid && self.needsAppTime
+            self.endFinishUpTime()
+        }
+    }
+
+    private func endFinishUpTime() {
+        guard finishUp != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(finishUp)
+        finishUp = .invalid
+    }
+
+    /// While the app sleeps, a small background transfer asks TorBox how it's getting on.
+    /// iOS runs it around the given time and wakes JDLite with the answer, so once TorBox
+    /// has the file, the download starts even with the app closed.
+    private func scheduleTorBoxCheck(_ id: UUID, webId: Int, after seconds: TimeInterval) {
+        guard let request = TorBox.shared.statusRequest(webId: webId) else { return }
+        let task = checks.downloadTask(with: request)
+        task.earliestBeginDate = Date().addingTimeInterval(seconds)
+        task.countOfBytesClientExpectsToSend = 500
+        task.countOfBytesClientExpectsToReceive = 10_000
+        task.taskDescription = "\(Self.checkPrefix)\n\(id.uuidString)\n\(webId)\n\(Int(seconds))"
+        task.resume()
+    }
+
+    fileprivate func torboxCheckFinished(_ id: UUID, webId: Int, interval: Int, body: Data?, status: Int) {
+        // While the app is open, the regular poller handles TorBox.
+        guard UIApplication.shared.applicationState == .background,
+              let item = items.first(where: { $0.id == id }), item.state == .resolving,
+              item.torboxId == webId, item.torboxFileId == nil else { return }
+        do {
+            guard let body, (200..<300).contains(status) else { throw URLError(.badServerResponse) }
+            let dl = try TorBox.parseStatus(body, id: webId)
+            if let failure = dl.failure {
+                mutate(id) { $0.torboxId = nil; $0.cloudProgress = nil }   // retry adds it again
+                failResolve(id, "TorBox: " + failure)
+            } else if dl.ready {
+                beginFinishUpTime()   // starting the download may need a moment
+                torboxReady(id, webId: webId, files: dl.files)
+            } else {
+                mutate(id, persist: false) {
+                    $0.status = dl.statusText
+                    $0.cloudProgress = dl.fraction
+                }
+                scheduleTorBoxCheck(id, webId: webId, after: Self.nextCheckDelay(after: interval))
+            }
+        } catch TorBoxError.gone {
+            mutate(id) { $0.torboxId = nil; $0.cloudProgress = nil }
+            failResolve(id, "TorBox: " + (TorBoxError.gone.errorDescription ?? "download gone"))
+        } catch {
+            scheduleTorBoxCheck(id, webId: webId, after: Self.nextCheckDelay(after: interval))
+        }
+    }
+
+    fileprivate func torboxCheckFailed(_ id: UUID, webId: Int, interval: Int) {
+        guard UIApplication.shared.applicationState == .background,
+              let item = items.first(where: { $0.id == id }), item.state == .resolving,
+              item.torboxId == webId, item.torboxFileId == nil else { return }
+        scheduleTorBoxCheck(id, webId: webId, after: Self.nextCheckDelay(after: interval))
+    }
+
+    /// The first check runs after 20 s; each later one waits twice as long, up to every 5 minutes.
+    nonisolated static func nextCheckDelay(after previous: Int) -> TimeInterval {
+        TimeInterval(min(max(previous * 2, 30), 300))
+    }
+
+    nonisolated static func parseCheck(_ s: String?) -> (id: UUID, webId: Int, interval: Int)? {
+        guard let s, s.hasPrefix(checkPrefix) else { return nil }
+        let lines = s.components(separatedBy: "\n")
+        guard lines.count >= 4, let id = UUID(uuidString: lines[1]), let webId = Int(lines[2]),
+              let interval = Int(lines[3]) else { return nil }
+        return (id: id, webId: webId, interval: interval)
+    }
+
+    /// iOS cancelled transfers on its own (app swiped away, Background App Refresh off,
+    /// low on resources). Keep their progress and carry on once possible.
+    fileprivate func systemCancelled(_ id: UUID, part: Int?, resumeData: Data?) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        if let part {
+            guard let segs = items[i].segments, segs.indices.contains(part), !segs[part].done else { return }
+            items[i].segments?[part].resumeData = resumeData
+        } else {
+            items[i].resumeData = resumeData
+        }
+        save()
+        pendingRestarts.insert(id)
+        restartTask?.cancel()
+        restartTask = Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)   // collect every cancelled part first
+            guard !Task.isCancelled else { return }
+            await self.restartCancelled()
+        }
+    }
+
+    private func restartCancelled() async {
+        let ids = pendingRestarts
+        pendingRestarts.removeAll()
+        let tasks = await liveTasks(for: ids)
+        let active = UIApplication.shared.applicationState == .active
+        for id in ids {
+            guard let i = items.firstIndex(where: { $0.id == id }), items[i].state == .downloading else { continue }
+            let mine = tasks.filter { Self.parseDesc($0.task.taskDescription)?.id == id }
+            if mine.isEmpty {
+                // Nothing left running: queue it to carry on from where it stopped.
+                flushProgress(at: i)
+                items[i].state = .queued
+                clearTransfer(id)
+            } else if active, let segs = items[i].segments, let request = downloadRequest(for: items[i]) {
+                // Some parts stopped while others kept going: restart just those parts.
+                let liveParts = Set(mine.compactMap { $0.part })
+                for k in segs.indices where !segs[k].done && !liveParts.contains(k) {
+                    launchPart(at: i, part: k, request: request)
+                }
+            }
+        }
+        save()
+        // Starting again in the background could just get cancelled again; carry on in the app.
+        if active { startNext() }
+    }
+
+    private func notifyFailed(_ id: UUID) {
+        if let item = items.first(where: { $0.id == id }), item.state == .failed {
+            Notifier.shared.failed(item)
         }
     }
 
@@ -873,6 +1079,7 @@ final class DownloadManager: NSObject, ObservableObject {
             $0.segments = nil
             $0.mergedThrough = nil
         }
+        if let item = items.first(where: { $0.id == id }) { Notifier.shared.finished(item) }
         startNext()
     }
 
@@ -888,6 +1095,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 $0.needsResolve = true
             }
         }
+        notifyFailed(id)
         startNext()
     }
 
@@ -911,6 +1119,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 $0.needsResolve = true   // retry checks TorBox/plugins again
             }
         }
+        notifyFailed(id)
         startNext()
     }
 
@@ -1043,6 +1252,16 @@ extension DownloadManager: URLSessionDownloadDelegate {
 
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                                 didFinishDownloadingTo location: URL) {
+        if let check = Self.parseCheck(downloadTask.taskDescription) {
+            // A TorBox status check made while the app was asleep (a small JSON reply).
+            let body: Data? = Self.fileSize(location) < 1_000_000 ? (try? Data(contentsOf: location)) : nil
+            let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
+            Task { @MainActor in
+                self.torboxCheckFinished(check.id, webId: check.webId, interval: check.interval,
+                                         body: body, status: status)
+            }
+            return
+        }
         guard let d = Self.parseDesc(downloadTask.taskDescription) else { return }
         let id = d.id
         let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
@@ -1105,11 +1324,26 @@ extension DownloadManager: URLSessionDownloadDelegate {
     }
 
     nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let error, let d = Self.parseDesc(task.taskDescription) else { return }
+        guard let error else { return }
         let ns = error as NSError
-        if ns.code == NSURLErrorCancelled { return } // pause/delete handle their own state
+        if let check = Self.parseCheck(task.taskDescription) {
+            if ns.code != NSURLErrorCancelled {
+                Task { @MainActor in self.torboxCheckFailed(check.id, webId: check.webId, interval: check.interval) }
+            }
+            return
+        }
+        guard let d = Self.parseDesc(task.taskDescription) else { return }
         let id = d.id
         let data = ns.userInfo[NSURLSessionDownloadTaskResumeData] as? Data
+        if ns.code == NSURLErrorCancelled {
+            // Our own pause/delete cancels are handled where they happen. iOS also cancels
+            // transfers itself (app swiped away, Background App Refresh off, low on
+            // resources): keep their progress so they carry on later.
+            if ns.userInfo[NSURLErrorBackgroundTaskCancelledReasonKey] != nil {
+                Task { @MainActor in self.systemCancelled(id, part: d.part, resumeData: data) }
+            }
+            return
+        }
         let msg = error.localizedDescription
         if let part = d.part {
             Task { @MainActor in self.partFailed(id, part: part, message: msg, resumeData: data) }
@@ -1123,6 +1357,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
                 $0.error = msg
                 $0.resumeData = data
             }
+            self.notifyFailed(id)
             self.advance()
         }
     }
