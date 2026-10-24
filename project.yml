@@ -14,6 +14,7 @@ targets:
         type: folder
     dependencies:
       - target: JDLiteExtension
+        embed: false   # CI copies the .appex into the app by hand (see build.yml)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.jdlite
