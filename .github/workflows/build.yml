@@ -1,75 +1,88 @@
-name: Build unsigned IPA
-
-# Manual only: tap "Run workflow" in the Actions tab.
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Generate Xcode project
-        run: brew install xcodegen && xcodegen generate
-
-      - name: Build (no code signing)
-        run: |
-          xcodebuild -project JDLite.xcodeproj -scheme JDLite \
-            -configuration Release -sdk iphoneos -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build
-
-      - name: Package IPA
-        run: |
-          OUT=build/Build/Products/Release-iphoneos
-          APP="$OUT/JDLite.app"
-          EXT="$OUT/JDLiteExtension.appex"
-          test -d "$APP"
-          test -d "$EXT"
-
-          # Safari only loads the extension if these sit at the top of the .appex.
-          for f in manifest.json popup.html popup.js popup.css content.js \
-                   icon-48.png icon-128.png icon-512.png toolbar-icon-38.png; do
-            if [ ! -f "$EXT/$f" ]; then
-              echo "::error::$f is missing from the top level of the Safari extension"
-              find "$EXT" -maxdepth 2 -print
-              exit 1
-            fi
-          done
-
-          rm -rf Payload JDLite.ipa
-          mkdir Payload
-          ditto "$APP" Payload/JDLite.app
-
-          # The app icon is compiled from Assets.xcassets into the app's Info.plist.
-          if ! plutil -p Payload/JDLite.app/Info.plist | grep -q CFBundleIcons; then
-            echo "::error::The app icon wasn't compiled into the app"
-            exit 1
-          fi
-          echo "App: $(plutil -extract CFBundleIdentifier raw Payload/JDLite.app/Info.plist)"
-          echo "Extension: $(plutil -extract CFBundleIdentifier raw "$EXT/Info.plist")"
-
-          # iOS only finds extensions in a folder named exactly "PlugIns". This Mac
-          # ignores letter case, so no other folder in the app may be called "plugins".
-          CLASH=$(ls Payload/JDLite.app | grep -ix "plugins" || true)
-          if [ -n "$CLASH" ] && [ "$CLASH" != "PlugIns" ]; then
-            echo "::error::The app has a folder called '$CLASH', which clashes with PlugIns"
-            exit 1
-          fi
-          mkdir -p Payload/JDLite.app/PlugIns
-          ditto "$EXT" Payload/JDLite.app/PlugIns/JDLiteExtension.appex
-
-          zip -qr JDLite.ipa Payload
-          if ! unzip -l JDLite.ipa | grep -q "Payload/JDLite.app/PlugIns/JDLiteExtension.appex/manifest.json"; then
-            echo "::error::The Safari extension isn't in the IPA's PlugIns folder"
-            unzip -l JDLite.ipa | grep -i "appex" | head -n 20
-            exit 1
-          fi
-          echo "Safari extension packaged in PlugIns/JDLiteExtension.appex"
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: JDLite-unsigned-ipa
-          path: JDLite.ipa
-          compression-level: 0
+name: JDLite
+options:
+  bundleIdPrefix: com.codeymoore
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  JDLite:
+    type: application
+    platform: iOS
+    sources:
+      - path: JDLite
+        excludes: ["BuiltInPlugins/**", "Plugins/**"]
+      # Bundled JS plugins. Not named "Plugins": the build machine ignores letter
+      # case, so it would clash with the app's "PlugIns" extension folder.
+      - path: JDLite/BuiltInPlugins
+        type: folder
+      - path: Shared
+    dependencies:
+      # CI copies both extensions into the app by hand (see build.yml).
+      - target: JDLiteExtension
+        embed: false
+      - target: JDLiteWidgets
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codeymoore.jdlite
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: JDLite/Info.plist
+      properties:
+        CFBundleDisplayName: JDLite
+        CFBundleShortVersionString: "1.3"
+        CFBundleVersion: "4"
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSSupportsLiveActivities: true
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.codeymoore.jdlite
+            CFBundleURLSchemes: [jdlite]
+  JDLiteExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: JDLiteExtension/SafariWebExtensionHandler.swift
+      # Added as individual files (not a folder reference): Safari only loads
+      # the extension if manifest.json is at the top level of the .appex.
+      - path: JDLiteExtension/Resources
+        buildPhase: resources
+    settings:
+      base:
+        # Extension IDs must start with the app's bundle ID.
+        PRODUCT_BUNDLE_IDENTIFIER: com.codeymoore.jdlite.extension
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: JDLiteExtension/Info.plist
+      properties:
+        CFBundleDisplayName: JDLite
+        CFBundleShortVersionString: "1.3"
+        CFBundleVersion: "4"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.Safari.web-extension
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SafariWebExtensionHandler
+  JDLiteWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: JDLiteWidgets/JDLiteWidgets.swift
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codeymoore.jdlite.widgets
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+    info:
+      path: JDLiteWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: JDLite
+        CFBundleShortVersionString: "1.3"
+        CFBundleVersion: "4"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
