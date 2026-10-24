@@ -1,22 +1,35 @@
-name: Build IPA
+name: Build unsigned IPA
+
+# Manual only: tap "Run workflow" in the Actions tab.
 on:
   workflow_dispatch:
-  push:
+
 jobs:
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: brew install xcodegen && xcodegen generate
-      - name: Build unsigned
+
+      - name: Generate Xcode project
+        run: brew install xcodegen && xcodegen generate
+
+      - name: Build (no code signing)
         run: |
-          xcodebuild -project JDLite.xcodeproj -scheme JDLite -configuration Release \
-            -sdk iphoneos -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+          xcodebuild -project JDLite.xcodeproj -scheme JDLite \
+            -configuration Release -sdk iphoneos -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package IPA
+        run: |
           mkdir Payload
           cp -R build/Build/Products/Release-iphoneos/JDLite.app Payload/
-          zip -qr JDLite.ipa Payload
+          zip -qry JDLite.ipa Payload
+          unzip -l JDLite.ipa | head -n 20
+
       - uses: actions/upload-artifact@v4
         with:
-          name: JDLite-ipa
+          name: JDLite-unsigned-ipa
           path: JDLite.ipa
+          compression-level: 0
