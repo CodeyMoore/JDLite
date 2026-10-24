@@ -23,14 +23,28 @@ jobs:
       - name: Package IPA
         run: |
           OUT=build/Build/Products/Release-iphoneos
-          test -d "$OUT/JDLite.app"
-          test -d "$OUT/JDLiteExtension.appex"
-          mkdir -p "$OUT/JDLite.app/PlugIns"
-          cp -R "$OUT/JDLiteExtension.appex" "$OUT/JDLite.app/PlugIns/"
+          APP="$OUT/JDLite.app"
+          APPEX="$OUT/JDLiteExtension.appex"
+          test -d "$APP"
+          test -d "$APPEX"
+
+          # Safari only loads the extension if these sit at the top of the .appex.
+          for f in manifest.json popup.html popup.js popup.css content.js; do
+            if [ ! -f "$APPEX/$f" ]; then
+              echo "::error::$f is missing from the top level of the Safari extension"
+              find "$APPEX" -maxdepth 2 -print
+              exit 1
+            fi
+          done
+          plutil -p "$APPEX/Info.plist" | grep -E "CFBundleIdentifier|NSExtensionPointIdentifier|NSExtensionPrincipalClass"
+
+          mkdir -p "$APP/PlugIns"
+          rm -rf "$APP/PlugIns/JDLiteExtension.appex"
+          cp -R "$APPEX" "$APP/PlugIns/"
           mkdir Payload
-          cp -R "$OUT/JDLite.app" Payload/
+          cp -R "$APP" Payload/
           zip -qry JDLite.ipa Payload
-          unzip -l JDLite.ipa | grep -E "Info.plist|\.appex/" | head -n 10
+          unzip -l JDLite.ipa | grep "PlugIns/JDLiteExtension.appex/manifest.json"
 
       - uses: actions/upload-artifact@v6
         with:
