@@ -61,8 +61,8 @@ jobs:
             exit 1
           fi
           mkdir -p Payload/JDLite.app/PlugIns
-          # Safari extension + widget extension (Live Activity).
-          for name in JDLiteExtension JDLiteWidgets; do
+          # Safari extension, widget extension (Live Activity) and share extension.
+          for name in JDLiteExtension JDLiteWidgets JDLiteShare; do
             if [ ! -f "$OUT/$name.appex/Info.plist" ]; then
               echo "::error::$name.appex wasn't built"
               exit 1
@@ -72,14 +72,14 @@ jobs:
           done
 
           zip -qr JDLite.ipa Payload
-          for f in JDLiteExtension.appex/manifest.json JDLiteWidgets.appex/Info.plist; do
+          for f in JDLiteExtension.appex/manifest.json JDLiteWidgets.appex/Info.plist JDLiteShare.appex/Info.plist; do
             if ! unzip -l JDLite.ipa | grep -q "Payload/JDLite.app/PlugIns/$f"; then
               echo "::error::$f isn't in the IPA's PlugIns folder"
               unzip -l JDLite.ipa | grep -i "appex" | head -n 20
               exit 1
             fi
           done
-          echo "Packaged the app with its Safari extension and Live Activity widget"
+          echo "Packaged the app with its Safari extension, Live Activity widget and share extension"
 
       - uses: actions/upload-artifact@v6
         with:
