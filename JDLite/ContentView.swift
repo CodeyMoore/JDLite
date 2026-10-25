@@ -666,7 +666,7 @@ struct AddLinksView: View {
     @EnvironmentObject var manager: DownloadManager
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
-    @State private var pickingTorrent = false
+    @State private var torrentPick: FilesPickRequest?
 
     private static let torrentType = UTType(filenameExtension: "torrent") ?? .data
 
@@ -689,7 +689,7 @@ struct AddLinksView: View {
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
                 Text(found).font(.footnote).foregroundStyle(.secondary)
                 Button {
-                    pickingTorrent = true
+                    torrentPick = FilesPickRequest(types: [Self.torrentType], asCopy: true, multiple: true)
                 } label: {
                     Label("Add .torrent Files…", systemImage: "doc.badge.plus")
                 }
@@ -700,17 +700,13 @@ struct AddLinksView: View {
                 Spacer()
             }
             .padding()
-            .sheet(isPresented: $pickingTorrent) {
-                // The Files picker in a sheet: SwiftUI's own file importer doesn't open on some iPhones.
-                DocumentPicker(types: [Self.torrentType], asCopy: true, multiple: true) { urls in
-                    guard !urls.isEmpty else { return }
-                    for url in urls { manager.importFile(url) }
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 600_000_000)   // let the picker close first
-                        dismiss()
-                    }
+            .filesPicker($torrentPick) { urls in
+                guard !urls.isEmpty else { return }
+                for url in urls { manager.importFile(url) }
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 600_000_000)   // let the picker close first
+                    dismiss()
                 }
-                .ignoresSafeArea()
             }
             .navigationTitle("Add links")
             .navigationBarTitleDisplayMode(.inline)

@@ -7,12 +7,11 @@ struct SettingsView: View {
     @ObservedObject private var location = SaveLocation.shared
     @ObservedObject private var network = NetworkMonitor.shared
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var pickerLog = PickerLog.shared
     @State private var folderError: String?
-    @State private var pickingFolder = false
-    @State private var pickerRound = 0          // counts each time the folder picker is opened
-    @State private var pickerOpenedAt: Date?    // when the picker appeared
-    @State private var pickerAnswered = false   // the picker reported a pick or a cancel
-    @State private var anchor = ViewAnchor()
+    @State private var folderPick: FilesPickRequest?
+    @State private var offerOtherWay = false    // after a cancel: maybe Open didn't work
+    @State private var testingWithFile = false
 
     var body: some View {
         NavigationStack {
@@ -67,15 +66,29 @@ struct SettingsView: View {
                         }
                     }
                     Button(location.folderName == nil ? "Choose a Folder…" : "Choose a Different Folder…") {
-                        openFolderPicker()
+                        chooseFolder(selecting: false)
+                    }
+                    if offerOtherWay {
+                        Button("Choose It Another Way…") {
+                            chooseFolder(selecting: true)
+                        }
+                        Button("Test the Picker With a File…") {
+                            testWithFile()
+                        }
                     }
                     if let folderError {
                         Text(folderError).foregroundStyle(.red)
                     }
+                    if !pickerLog.lines.isEmpty {
+                        Text(pickerLog.lines.joined(separator: "\n"))
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
                 } header: {
                     Text("Save Files To")
                 } footer: {
-                    Text("Tap Choose a Folder, go into the folder you want (for example in iCloud Drive or on a USB drive), then tap Open. If that folder isn't available when a download finishes, the file goes to JDLite's Downloads folder (Files › On My iPhone › JDLite) instead.")
+                    Text(offerOtherWay ? Self.otherWayHelp : Self.folderHelp)
                 }
 
                 Section {
@@ -98,20 +111,15 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Version", value: Self.versionText)
+                    LabeledContent("Bundle ID", value: AppIdentity.bundleID)
+                    LabeledContent("Signed As", value: AppIdentity.signedAs)
+                    LabeledContent("Added Libraries", value: AppIdentity.addedLibraries)
+                } header: {
+                    Text("This Install")
                 }
             }
-            .background(AnchorView(anchor: anchor))
-            .sheet(isPresented: $pickingFolder, onDismiss: { folderPickerClosed() }) {
-                DocumentPicker(types: [.folder]) { urls in
-                    pickerAnswered = true
-                    if urls.isEmpty && pickerClosedRightAway {
-                        folderError = Self.closedByItself
-                    }
-                    useFolder(urls.first)
-                    closeFolderPicker()
-                }
-                .ignoresSafeArea()
-                .onAppear { pickerOpenedAt = Date() }
+            .filesPicker($folderPick) { urls in
+                folderPicked(urls)
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -121,68 +129,55 @@ struct SettingsView: View {
         }
     }
 
-    private static let closedByItself = "The Files picker closed by itself as it opened, so no folder was chosen. Try again."
+    private static let folderHelp = "Tap Choose a Folder, go into the folder you want (for example in iCloud Drive or on a USB drive), then tap Open. If that folder isn't available when a download finishes, the file goes to JDLite's Downloads folder (Files › On My iPhone › JDLite) instead."
 
-    private func openFolderPicker() {
+    private static let otherWayHelp = "If Open didn't do anything, tap Choose It Another Way. Go to the folder that holds the one you want, select that folder (tap Select first if you see it), then tap Open.\n\nTest the Picker With a File checks whether the picker can hand anything to JDLite: pick any file (nothing is changed or copied). The grey lines above show what the picker did."
+
+    /// Opens the Files picker for a folder. Normally you go into the folder and tap Open; with
+    /// `selecting`, you select the folder from the one above it instead.
+    private func chooseFolder(selecting: Bool) {
         folderError = nil
-        pickerRound += 1
-        pickerOpenedAt = nil
-        pickerAnswered = false
-        pickingFolder = true
-        let round = pickerRound
-        Task { @MainActor in
-            // If the picker hasn't appeared after 2 seconds, show it straight from UIKit instead.
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            guard round == pickerRound, pickingFolder, pickerOpenedAt == nil else { return }
-            pickingFolder = false
-            try? await Task.sleep(nanoseconds: 500_000_000)   // let SwiftUI give up on its sheet first
-            guard round == pickerRound, anchor.view?.window != nil else { return }   // Settings still open
-            DirectDocumentPicker.present(types: [.folder], from: anchor.view, onFailure: { onScreen in
-                folderError = "The Files picker didn't open. (Showing: \(onScreen))"
-            }, onFinish: { urls in
-                useFolder(urls.first)
-            })
+        testingWithFile = false
+        pickerLog.add(selecting ? "— Choose It Another Way —" : "— Choose a Folder —")
+        folderPick = FilesPickRequest(types: [.folder], multiple: selecting, logs: true)
+    }
+
+    /// Checks whether the picker can hand anything over, using a file instead of a folder.
+    private func testWithFile() {
+        folderError = nil
+        testingWithFile = true
+        pickerLog.add("— Test With a File —")
+        folderPick = FilesPickRequest(types: [.item], logs: true)
+    }
+
+    private func folderPicked(_ urls: [URL]) {
+        if testingWithFile {
+            testingWithFile = false
+            pickerLog.add(urls.isEmpty ? "Test: no file came through" : "Test: the picker handed over \(urls[0].lastPathComponent)")
+            return
         }
-    }
-
-    /// The picker closes its own sheet; this just makes sure SwiftUI knows it's closed.
-    private func closeFolderPicker() {
-        let round = pickerRound
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 600_000_000)
-            if round == pickerRound && pickingFolder { pickingFolder = false }
+        guard let url = urls.first else {
+            offerOtherWay = true   // cancelled: maybe because Open didn't work
+            return
         }
-    }
-
-    /// The picker's sheet has gone. If that happened the moment it appeared without the picker
-    /// reporting anything, the Files picker itself failed.
-    private func folderPickerClosed() {
-        if !pickerAnswered && pickerClosedRightAway {
-            folderError = Self.closedByItself
-        }
-    }
-
-    private var pickerClosedRightAway: Bool {
-        guard let opened = pickerOpenedAt else { return false }
-        return Date().timeIntervalSince(opened) < 0.6
-    }
-
-    private func useFolder(_ url: URL?) {
-        guard let url else { return }   // cancelled: nothing changes
         // The picker also lets .torrent files be picked (JDLite opens them), so check it's a folder.
         let scoped = url.startAccessingSecurityScopedResource()
         let isFolder = url.hasDirectoryPath
             || (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
         if scoped { url.stopAccessingSecurityScopedResource() }
         guard isFolder else {
-            folderError = "That's a file, not a folder. Go into the folder you want and tap Open."
+            folderError = "That's a file, not a folder. Pick a folder instead."
+            pickerLog.add("Not a folder")
             return
         }
         do {
             try location.choose(url)
             folderError = nil
+            offerOtherWay = false
+            pickerLog.add("Saving files to \(url.lastPathComponent)")
         } catch {
             folderError = "Couldn't use that folder: \(error.localizedDescription)"
+            pickerLog.add("Couldn't keep access: \(error.localizedDescription)")
         }
     }
 
