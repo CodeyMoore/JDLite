@@ -700,12 +700,17 @@ struct AddLinksView: View {
                 Spacer()
             }
             .padding()
-            .fileImporter(isPresented: $pickingTorrent, allowedContentTypes: [Self.torrentType],
-                          allowsMultipleSelection: true) { result in
-                if case .success(let urls) = result, !urls.isEmpty {
+            .sheet(isPresented: $pickingTorrent) {
+                // The Files picker in a sheet: SwiftUI's own file importer doesn't open on some iPhones.
+                DocumentPicker(types: [Self.torrentType], asCopy: true, multiple: true) { urls in
+                    guard !urls.isEmpty else { return }
                     for url in urls { manager.importFile(url) }
-                    dismiss()
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 600_000_000)   // let the picker close first
+                        dismiss()
+                    }
                 }
+                .ignoresSafeArea()
             }
             .navigationTitle("Add links")
             .navigationBarTitleDisplayMode(.inline)

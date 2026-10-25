@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
@@ -7,6 +8,11 @@ struct SettingsView: View {
     @ObservedObject private var network = NetworkMonitor.shared
     @Environment(\.dismiss) private var dismiss
     @State private var folderError: String?
+    @State private var pickingFolder = false
+    @State private var pickerRound = 0          // counts each time the folder picker is opened
+    @State private var pickerOpenedAt: Date?    // when the picker appeared
+    @State private var pickerAnswered = false   // the picker reported a pick or a cancel
+    @State private var anchor = ViewAnchor()
 
     var body: some View {
         NavigationStack {
@@ -61,7 +67,7 @@ struct SettingsView: View {
                         }
                     }
                     Button(location.folderName == nil ? "Choose a Folder…" : "Choose a Different Folder…") {
-                        pickFolder()
+                        openFolderPicker()
                     }
                     if let folderError {
                         Text(folderError).foregroundStyle(.red)
@@ -89,6 +95,23 @@ struct SettingsView: View {
                 } footer: {
                     Text("Shows download progress on the Lock Screen and in the Dynamic Island.")
                 }
+
+                Section {
+                    LabeledContent("Version", value: Self.versionText)
+                }
+            }
+            .background(AnchorView(anchor: anchor))
+            .sheet(isPresented: $pickingFolder, onDismiss: { folderPickerClosed() }) {
+                DocumentPicker(types: [.folder]) { urls in
+                    pickerAnswered = true
+                    if urls.isEmpty && pickerClosedRightAway {
+                        folderError = Self.closedByItself
+                    }
+                    useFolder(urls.first)
+                    closeFolderPicker()
+                }
+                .ignoresSafeArea()
+                .onAppear { pickerOpenedAt = Date() }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -98,16 +121,76 @@ struct SettingsView: View {
         }
     }
 
-    private func pickFolder() {
-        FolderPicker.shared.present { url in
-            guard let url else { return }   // cancelled: nothing changes
-            do {
-                try location.choose(url)
-                folderError = nil
-            } catch {
-                folderError = "Couldn't use that folder: \(error.localizedDescription)"
-            }
+    private static let closedByItself = "The Files picker closed by itself as it opened, so no folder was chosen. Try again."
+
+    private func openFolderPicker() {
+        folderError = nil
+        pickerRound += 1
+        pickerOpenedAt = nil
+        pickerAnswered = false
+        pickingFolder = true
+        let round = pickerRound
+        Task { @MainActor in
+            // If the picker hasn't appeared after 2 seconds, show it straight from UIKit instead.
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard round == pickerRound, pickingFolder, pickerOpenedAt == nil else { return }
+            pickingFolder = false
+            try? await Task.sleep(nanoseconds: 500_000_000)   // let SwiftUI give up on its sheet first
+            guard round == pickerRound, anchor.view?.window != nil else { return }   // Settings still open
+            DirectDocumentPicker.present(types: [.folder], from: anchor.view, onFailure: { onScreen in
+                folderError = "The Files picker didn't open. (Showing: \(onScreen))"
+            }, onFinish: { urls in
+                useFolder(urls.first)
+            })
         }
+    }
+
+    /// The picker closes its own sheet; this just makes sure SwiftUI knows it's closed.
+    private func closeFolderPicker() {
+        let round = pickerRound
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            if round == pickerRound && pickingFolder { pickingFolder = false }
+        }
+    }
+
+    /// The picker's sheet has gone. If that happened the moment it appeared without the picker
+    /// reporting anything, the Files picker itself failed.
+    private func folderPickerClosed() {
+        if !pickerAnswered && pickerClosedRightAway {
+            folderError = Self.closedByItself
+        }
+    }
+
+    private var pickerClosedRightAway: Bool {
+        guard let opened = pickerOpenedAt else { return false }
+        return Date().timeIntervalSince(opened) < 0.6
+    }
+
+    private func useFolder(_ url: URL?) {
+        guard let url else { return }   // cancelled: nothing changes
+        // The picker also lets .torrent files be picked (JDLite opens them), so check it's a folder.
+        let scoped = url.startAccessingSecurityScopedResource()
+        let isFolder = url.hasDirectoryPath
+            || (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        if scoped { url.stopAccessingSecurityScopedResource() }
+        guard isFolder else {
+            folderError = "That's a file, not a folder. Go into the folder you want and tap Open."
+            return
+        }
+        do {
+            try location.choose(url)
+            folderError = nil
+        } catch {
+            folderError = "Couldn't use that folder: \(error.localizedDescription)"
+        }
+    }
+
+    private static var versionText: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(version) (\(build))"
     }
 
     private func locationRow(_ title: String, symbol: String, chosen: Bool) -> some View {
