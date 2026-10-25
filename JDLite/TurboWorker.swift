@@ -274,6 +274,7 @@ final class TurboWorker: NSObject, URLSessionDataDelegate, @unchecked Sendable {
             return
         }
         position += Int64(chunk.count)
+        let pause = SpeedLimiter.shared.take(chunk.count)
         if position > end {
             finish(.finished)
         } else {
@@ -283,7 +284,22 @@ final class TurboWorker: NSObject, URLSessionDataDelegate, @unchecked Sendable {
                 synced = position
                 lastSync = now
             }
+            if pause > 0.002 {
+                // Ahead of the speed limit: stop reading for a moment (the server slows down too).
+                dataTask.suspend()
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + pause) { [weak self] in
+                    self?.endPause(dataTask)
+                }
+            }
         }
+    }
+
+    /// Carries on reading after a pause for the speed limit.
+    private func endPause(_ paused: URLSessionDataTask) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard paused === task, !stopped, !reported else { return }
+        paused.resume()
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {

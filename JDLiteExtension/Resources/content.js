@@ -9,6 +9,7 @@
   globalThis.__jdliteScanner = VERSION;
 
   const URL_IN_TEXT = /\bhttps?:\/\/[^\s"'<>()\[\]{}`|^\\]+/gi;
+  const MAGNET_IN_TEXT = /\bmagnet:\?[^\s"'<>`]+/gi;
   // Root-relative paths to files inside code, e.g. location.href = "/files/app-2.1.zip"
   const PATH_IN_CODE = /["'`](\/[^"'`\s<>]{1,400}?\.[a-z0-9]{1,8}(?:\?[^"'`\s<>]{0,400})?)["'`]/gi;
   const DOWNLOAD_WORDS = /\b(?:download|downloads|dl|direct link|get (?:the )?file|mirror|herunterladen|t[ée]l[ée]charger|descargar|scarica|baixar|pobierz|indir|downloaden|ladda ner)\b|скачать|завантажити|下载|下載|ダウンロード|다운로드|تحميل/i;
@@ -56,7 +57,7 @@
       if (!raw || raw.length > 4000) return;
       let u;
       try { u = new URL(raw, base); } catch (e) { return; }
-      if (u.protocol !== "http:" && u.protocol !== "https:") return;
+      if (u.protocol !== "http:" && u.protocol !== "https:" && u.protocol !== "magnet:") return;   // magnet: torrents
       if (u.href.split("#")[0] === page && info.source !== "self") return;   // links within this page
       // Keep the #fragment: some hosters (e.g. MEGA) put the file key there.
       const at = index.get(u.href);
@@ -86,6 +87,7 @@
       text = text.slice(0, textLeft);
       textLeft -= text.length;
       for (const m of text.matchAll(URL_IN_TEXT)) add(trimURL(m[0]), { source: "text" });
+      for (const m of text.matchAll(MAGNET_IN_TEXT)) add(trimURL(m[0]), { source: "text" });
     };
 
     const scanCode = (code, source, hint) => {
@@ -95,6 +97,7 @@
       // Undo JSON/JS escaping: https:\/\/example.com\/file.zip
       code = code.replace(/\\u002[fF]/g, "/").replace(/\\\//g, "/");
       for (const m of code.matchAll(URL_IN_TEXT)) add(trimURL(m[0]), { source, hint });
+      for (const m of code.matchAll(MAGNET_IN_TEXT)) add(trimURL(m[0]), { source, hint });
       for (const m of code.matchAll(PATH_IN_CODE)) add(m[1], { source, hint });
     };
 
@@ -177,7 +180,7 @@
       });
       let chunk = "";
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-        if (!/https?:/i.test(n.nodeValue)) continue;
+        if (!/https?:|magnet:/i.test(n.nodeValue)) continue;
         chunk += n.nodeValue + "\n";
         if (chunk.length > 65536) { scanText(chunk); chunk = ""; }
       }

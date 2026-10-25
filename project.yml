@@ -21,6 +21,8 @@ targets:
         embed: false
       - target: JDLiteWidgets
         embed: false
+      - target: JDLiteShare
+        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.codeymoore.jdlite
@@ -31,8 +33,8 @@ targets:
       path: JDLite/Info.plist
       properties:
         CFBundleDisplayName: JDLite
-        CFBundleShortVersionString: "1.5"
-        CFBundleVersion: "6"
+        CFBundleShortVersionString: "1.6"
+        CFBundleVersion: "7"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
@@ -44,6 +46,18 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: com.codeymoore.jdlite
             CFBundleURLSchemes: [jdlite]
+        # .torrent files: "Open in JDLite" from the Files app and the share sheet.
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: org.bittorrent.torrent
+            UTTypeDescription: BitTorrent file
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [torrent]
+              public.mime-type: [application/x-bittorrent]
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: BitTorrent file
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [org.bittorrent.torrent]
   JDLiteExtension:
     type: app-extension
     platform: iOS
@@ -63,8 +77,8 @@ targets:
       path: JDLiteExtension/Info.plist
       properties:
         CFBundleDisplayName: JDLite
-        CFBundleShortVersionString: "1.5"
-        CFBundleVersion: "6"
+        CFBundleShortVersionString: "1.6"
+        CFBundleVersion: "7"
         # The extension checks links on any site (some still use plain http).
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
@@ -87,7 +101,34 @@ targets:
       path: JDLiteWidgets/Info.plist
       properties:
         CFBundleDisplayName: JDLite
-        CFBundleShortVersionString: "1.5"
-        CFBundleVersion: "6"
+        CFBundleShortVersionString: "1.6"
+        CFBundleVersion: "7"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
+  JDLiteShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: JDLiteShare
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.codeymoore.jdlite.share
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: JDLiteShare/Info.plist
+      properties:
+        CFBundleDisplayName: JDLite
+        CFBundleShortVersionString: "1.6"
+        CFBundleVersion: "7"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            # Shows up for links, text with links in it, and .torrent files.
+            NSExtensionActivationRule: >-
+              SUBQUERY (extensionItems, $extensionItem, SUBQUERY ($extensionItem.attachments, $attachment,
+              ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.url"
+              OR ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.plain-text"
+              OR ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "org.bittorrent.torrent"
+              ).@count >= 1).@count >= 1

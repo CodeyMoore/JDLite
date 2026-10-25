@@ -57,6 +57,10 @@ struct DownloadItem: Identifiable, Codable {
     var segments: [Segment]?         // the file's parts, once its size is known
     var singleConnection: Bool?      // the server can't send parts of this file
     var layout: Int?                 // 2: parts are saved into one data file
+    var torboxKind: TorBoxKind?      // .torrent for torrents (nil: a link from a file host)
+    var torrentFile: String?         // a .torrent file waiting to go to TorBox (in Torrents/)
+    var savedBookmark: Data?         // the finished file, when it's in a folder you picked
+    var savedFolder: String?         // that folder's name (nil: JDLite's Downloads folder)
 
     var progress: Double { bytesTotal > 0 ? min(Double(bytesReceived) / Double(bytesTotal), 1) : 0 }
 
@@ -106,6 +110,7 @@ final class DownloadManager: NSObject, ObservableObject {
     private var liveBytes: [UUID: [Int64: Int64]] = [:]  // background part progress not yet copied into items
     private var bgLive: [UUID: Set<Int64>] = [:]         // parts a background transfer is fetching
     private var absorbing = Set<String>()
+    private var delivering = Set<UUID>()
     private var probing = Set<UUID>()
     private var finishUp: UIBackgroundTaskIdentifier = .invalid
     private var pendingRestarts = Set<UUID>()
@@ -139,6 +144,8 @@ final class DownloadManager: NSObject, ObservableObject {
         checkConfig.isDiscretionary = false
         checks = URLSession(configuration: checkConfig, delegate: self, delegateQueue: nil)
         inApp = UIApplication.shared.applicationState != .background
+        _ = AppSettings.shared   // applies the speed limit
+        NetworkMonitor.shared.start()
         observeAppState()
         reconcile()
     }
@@ -150,7 +157,10 @@ final class DownloadManager: NSObject, ObservableObject {
         for url in urls where !items.contains(where: { ($0.sourceURL ?? $0.url) == url && $0.state != .completed }) {
             var name = url.lastPathComponent
             if name.isEmpty || name == "/" { name = url.host ?? "download" }
+            let magnet = url.scheme?.lowercased() == "magnet"
+            if magnet { name = Self.magnetName(url) }
             var item = DownloadItem(url: url, fileName: Self.cleanName(name))
+            if magnet { item.torboxKind = .torrent }
             item.state = .resolving
             item.needsResolve = true
             item.sourceURL = url
@@ -163,16 +173,59 @@ final class DownloadManager: NSObject, ObservableObject {
         for id in ids { Task { await runResolve(id) } }
     }
 
-    /// Handles jdlite://add?u=<url>&u=<url> links sent by the Safari extension.
+    /// Handles jdlite://add?u=<url>&u=<url> links from the Safari and share extensions
+    /// (t=<base64 .torrent file>&tn=<its name> for torrent files), and files opened in JDLite.
     func handleOpen(_ url: URL) {
+        if url.isFileURL {
+            importFile(url)
+            return
+        }
         guard url.scheme == "jdlite", url.host == "add",
               let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
-        let urls = (comps.queryItems ?? [])
+        let query = comps.queryItems ?? []
+        let urls = query
             .filter { $0.name == "u" }
             .compactMap { $0.value }
             .compactMap { URL(string: $0) }
-            .filter { ["http", "https"].contains($0.scheme?.lowercased() ?? "") }
+            .filter { ["http", "https", "magnet"].contains($0.scheme?.lowercased() ?? "") }
         add(urls: urls)
+        let names = query.filter { $0.name == "tn" }.compactMap { $0.value }
+        for (k, encoded) in query.filter({ $0.name == "t" }).compactMap({ $0.value }).enumerated() {
+            if let data = Self.base64URLDecode(encoded) {
+                addTorrentFile(data, name: k < names.count ? names[k] : "Torrent")
+            }
+        }
+    }
+
+    /// A .torrent file opened in JDLite (Share › JDLite, or Open In from the Files app).
+    func importFile(_ url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard url.pathExtension.lowercased() == "torrent",
+              let data = try? Data(contentsOf: url), !data.isEmpty, data.count < 50_000_000 else { return }
+        addTorrentFile(data, name: url.lastPathComponent)
+        // Files handed over by other apps are copied into Documents/Inbox: tidy that up.
+        if url.path.contains("/Documents/Inbox/") { try? FileManager.default.removeItem(at: url) }
+    }
+
+    /// Adds a .torrent file. It goes to TorBox, which fetches the torrent; then the files download.
+    func addTorrentFile(_ data: Data, name: String) {
+        let stored = UUID().uuidString + ".torrent"
+        let file = Self.torrentsDir.appendingPathComponent(stored)
+        try? FileManager.default.createDirectory(at: Self.torrentsDir, withIntermediateDirectories: true)
+        guard (try? data.write(to: file, options: .atomic)) != nil else { return }
+        let stem = (name as NSString).deletingPathExtension
+        var item = DownloadItem(url: file, fileName: Self.cleanName(stem.isEmpty ? "Torrent" : stem))
+        item.state = .resolving
+        item.needsResolve = true
+        item.torboxKind = .torrent
+        item.torrentFile = stored
+        item.addedAt = Date()
+        items.append(item)
+        save()
+        Notifier.shared.askPermissionIfNeeded()
+        let id = item.id
+        Task { await runResolve(id) }
     }
 
     func resume(_ id: UUID) {
@@ -231,10 +284,15 @@ final class DownloadManager: NSObject, ObservableObject {
             for (task, _) in await liveTasks(for: ids) { task.cancel() }
         }
         let remaining = items.filter { !ids.contains($0.id) }
-        let stillUsed = Set(remaining.compactMap { $0.savedFileName })
+        let stillUsed = Set(remaining.filter { $0.savedBookmark == nil }.compactMap { $0.savedFileName })
         for item in items where ids.contains(item.id) {
             try? FileManager.default.removeItem(at: Self.partsDir(item.id))
-            if let name = item.savedFileName, !stillUsed.contains(name) {
+            if let stored = item.torrentFile {
+                try? FileManager.default.removeItem(at: Self.torrentsDir.appendingPathComponent(stored))
+            }
+            if let bookmark = item.savedBookmark {
+                Self.removeSaved(name: item.savedName ?? "", bookmark: bookmark)
+            } else if let name = item.savedFileName, !stillUsed.contains(name) {
                 try? FileManager.default.removeItem(at: Self.downloadsDir.appendingPathComponent(name))
             }
         }
@@ -245,6 +303,11 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// Removes finished downloads from the list. Their files stay in Downloads.
     func clearCompleted() {
+        for item in items where item.state == .completed {
+            if let stored = item.torrentFile {
+                try? FileManager.default.removeItem(at: Self.torrentsDir.appendingPathComponent(stored))
+            }
+        }
         items.removeAll { $0.state == .completed }
         save()
     }
@@ -253,15 +316,41 @@ final class DownloadManager: NSObject, ObservableObject {
     func settingsChanged() { startNext() }
 
     nonisolated static func extractLinks(from text: String) -> [URL] {
-        guard let det = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else { return [] }
         var seen = Set<URL>()
         var out: [URL] = []
-        det.enumerateMatches(in: text, range: NSRange(text.startIndex..., in: text)) { m, _, _ in
-            if let u = m?.url, ["http", "https"].contains(u.scheme?.lowercased() ?? ""), seen.insert(u).inserted {
+        if let det = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
+            det.enumerateMatches(in: text, range: NSRange(text.startIndex..., in: text)) { m, _, _ in
+                if let u = m?.url, ["http", "https"].contains(u.scheme?.lowercased() ?? ""), seen.insert(u).inserted {
+                    out.append(u)
+                }
+            }
+        }
+        // Magnet links (torrents), which the link detector doesn't pick up.
+        if let magnets = try? NSRegularExpression(pattern: "magnet:\\?[^\\s\"'<>]+", options: [.caseInsensitive]) {
+            for m in magnets.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                guard let r = Range(m.range, in: text), let u = URL(string: String(text[r])), seen.insert(u).inserted else { continue }
                 out.append(u)
             }
         }
         return out
+    }
+
+    /// A magnet link's display name (dn=...), or a short name made from its hash.
+    nonisolated static func magnetName(_ url: URL) -> String {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        if let name = items.first(where: { $0.name == "dn" })?.value, !name.isEmpty {
+            return name.replacingOccurrences(of: "+", with: " ")   // magnet names use + for spaces
+        }
+        if let xt = items.first(where: { $0.name == "xt" })?.value {
+            return "Torrent " + String(xt.split(separator: ":").last?.prefix(8) ?? "")
+        }
+        return "Torrent"
+    }
+
+    nonisolated static func base64URLDecode(_ s: String) -> Data? {
+        var b64 = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64 += "=" }
+        return Data(base64Encoded: b64)
     }
 
     // MARK: Resolving: plugins first, then TorBox, otherwise download the link directly
@@ -279,6 +368,13 @@ final class DownloadManager: NSObject, ObservableObject {
                 setStatus(id, "Waiting for TorBox…")
                 startTorBoxPolling()
             }
+            return
+        }
+
+        // Torrents (magnet links, .torrent files, links to .torrent files) are fetched by TorBox.
+        if item.torboxKind == .torrent || item.torrentFile != nil
+            || (link.pathExtension.lowercased() == "torrent" && TorBox.shared.isActive) {
+            await sendTorrent(id, item: item, link: link)
             return
         }
 
@@ -314,6 +410,46 @@ final class DownloadManager: NSObject, ObservableObject {
         guard isResolving(id) else { return }
         mutate(id) { $0.state = .queued; $0.needsResolve = nil; $0.status = nil }
         startNext()
+    }
+
+    private func sendTorrent(_ id: UUID, item: DownloadItem, link: URL) async {
+        guard TorBox.shared.isActive else {
+            failResolve(id, TorBox.shared.hasKey
+                ? "Torrents download through TorBox, which is switched off in ⋯ › TorBox."
+                : "Torrents and magnet links download through TorBox. Add your TorBox API key in ⋯ › TorBox, then tap retry.")
+            return
+        }
+        setStatus(id, "Sending to TorBox…")
+        do {
+            let torrentId: Int
+            if let stored = item.torrentFile {
+                let data = try Data(contentsOf: Self.torrentsDir.appendingPathComponent(stored))
+                torrentId = try await TorBox.shared.createTorrent(file: data, name: item.fileName)
+            } else if link.scheme?.lowercased() == "magnet" {
+                torrentId = try await TorBox.shared.createTorrent(magnet: link.absoluteString)
+            } else {
+                // A link to a .torrent file: fetch the small file, then hand it to TorBox.
+                var req = URLRequest(url: link, timeoutInterval: 30)
+                for (k, v) in item.headers ?? [:] { req.setValue(v, forHTTPHeaderField: k) }
+                let (data, response) = try await URLSession.shared.data(for: req)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 200
+                guard (200..<300).contains(status), data.first == UInt8(ascii: "d") else {
+                    throw TorBoxError.api("That link didn't give a .torrent file (HTTP \(status)).")
+                }
+                torrentId = try await TorBox.shared.createTorrent(file: data, name: link.lastPathComponent)
+            }
+            guard items.contains(where: { $0.id == id }) else { return }
+            // The .torrent file is kept until the download is removed, so a retry can send it again.
+            mutate(id) {
+                $0.torboxId = torrentId
+                $0.torboxKind = .torrent
+            }
+            guard isResolving(id) else { return }
+            setStatus(id, "Waiting for TorBox…")
+            startTorBoxPolling(restart: true)
+        } catch {
+            failResolve(id, "TorBox: " + error.localizedDescription)
+        }
     }
 
     private func applyResolved(_ id: UUID, _ links: [ResolvedLink]) {
@@ -362,19 +498,22 @@ final class DownloadManager: NSObject, ObservableObject {
             pollSoon = false
             let waiting = items.filter { $0.state == .resolving && $0.torboxId != nil && $0.torboxFileId == nil }
             if waiting.isEmpty { return }
-            // With several links waiting, one request gets the status of all of them.
-            var batch: [Int: TorBoxWebDownload] = [:]
-            if waiting.count > 1, let list = try? await TorBox.shared.webDownloadList() { batch = list }
+            // With several links of a kind waiting, one request gets the status of all of them.
+            var batches: [TorBoxKind: [Int: TorBoxWebDownload]] = [:]
+            for kind in [TorBoxKind.web, .torrent] where waiting.filter({ ($0.torboxKind ?? .web) == kind }).count > 1 {
+                if let list = try? await TorBox.shared.statusList(kind) { batches[kind] = list }
+            }
             for item in waiting {
                 guard let webId = item.torboxId, isResolving(item.id) else { continue }
+                let kind = item.torboxKind ?? .web
                 var askedAPI = false
                 do {
                     let dl: TorBoxWebDownload
-                    if let known = batch[webId] {
+                    if let known = batches[kind]?[webId] {
                         dl = known
                     } else {
                         askedAPI = true
-                        dl = try await TorBox.shared.webDownload(id: webId)
+                        dl = try await TorBox.shared.status(kind, id: webId)
                     }
                     strikes[item.id] = nil
                     if isResolving(item.id) {   // not paused or removed meanwhile
@@ -437,6 +576,7 @@ final class DownloadManager: NSObject, ObservableObject {
             extra.preferredName = Self.cleanName(file.name)
             extra.sourceURL = origin
             extra.torboxId = webId
+            extra.torboxKind = item.torboxKind
             extra.torboxFileId = file.id
             extra.bytesTotal = max(file.size ?? 0, 0)
             extra.addedAt = Date()
@@ -466,6 +606,13 @@ final class DownloadManager: NSObject, ObservableObject {
     private var startNextAgain = false
 
     private func startNext() {
+        if let wait = networkWait {
+            // The network setting doesn't allow downloads right now: they wait.
+            for i in items.indices where items[i].state == .queued && items[i].status != wait {
+                items[i].status = wait
+            }
+            return
+        }
         // Starting a download can finish another (and call this again): go round again then.
         if startingNext {
             startNextAgain = true
@@ -482,14 +629,66 @@ final class DownloadManager: NSObject, ObservableObject {
         } while startNextAgain
     }
 
+    // MARK: Network setting
+
+    /// Why downloads have to wait under the network setting right now, or nil if they can run.
+    private var networkWait: String? {
+        NetworkMonitor.shared.waitReason(for: AppSettings.shared.networkMode)
+    }
+
+    /// The network changed, or the network setting did.
+    func networkChanged() {
+        if let wait = networkWait {
+            // Hold every running download until the right network is back. They carry on
+            // from where they stopped.
+            for item in items where item.state == .downloading { hold(item.id, reason: wait) }
+            for i in items.indices where items[i].state == .queued { items[i].status = wait }
+            save()
+            if UIApplication.shared.applicationState == .background, !BackgroundKeeper.shared.isRunning {
+                startHeldInBackground()
+            }
+        } else {
+            for i in items.indices where items[i].state == .queued && (items[i].status ?? "").hasPrefix("Waiting for") {
+                items[i].status = nil
+            }
+            startNext()
+            save()
+        }
+    }
+
+    /// Stops a download for now (not paused by you): it's queued again with a note why.
+    private func hold(_ id: UUID, reason: String) {
+        turboStop(id)
+        bgLive[id] = nil
+        refreshProgress(id)
+        mutate(id, persist: false) {
+            $0.state = .queued
+            $0.status = reason
+        }
+        clearTransfer(id)
+        Task { await stopTransfers(for: id) }
+    }
+
+    /// With Wi-Fi Only, downloads waiting for Wi-Fi can be handed to iOS's background
+    /// downloader before JDLite goes to sleep: it starts them by itself once Wi-Fi is back.
+    private func startHeldInBackground() {
+        guard AppSettings.shared.networkMode == .wifiOnly, !inApp else { return }
+        var active = items.filter { $0.state == .downloading }.count
+        for i in items.indices where active < maxConcurrent && items[i].state == .queued {
+            if begin(at: i) { active += 1 }
+        }
+    }
+
     /// The request for the file itself (TorBox downloads use TorBox's permanent link).
     private func downloadRequest(for item: DownloadItem) -> URLRequest? {
         var target = item.url
         if let webId = item.torboxId, let fileId = item.torboxFileId {
-            guard let link = TorBox.shared.permalink(webId: webId, fileId: fileId) else { return nil }
+            guard let link = TorBox.shared.permalink(item.torboxKind ?? .web, id: webId, fileId: fileId) else { return nil }
             target = link
         }
         var req = URLRequest(url: target)
+        // Wi-Fi Only also stops iOS's background downloader from using mobile data.
+        req.allowsCellularAccess = AppSettings.shared.networkMode != .wifiOnly
         for (k, v) in item.headers ?? [:] { req.setValue(v, forHTTPHeaderField: k) }
         if req.value(forHTTPHeaderField: "Accept-Encoding") == nil {
             req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")   // byte ranges need the file as it is
@@ -641,7 +840,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// Adds in-app connections until the download uses as many as it's allowed.
     private func fillConnections(at i: Int) {
-        guard inApp, items[i].state == .downloading, items[i].segments != nil,
+        guard inApp, networkWait == nil, items[i].state == .downloading, items[i].segments != nil,
               let request = transferRequest(for: items[i]) else { return }
         let id = items[i].id
         let single = items[i].singleConnection == true
@@ -774,7 +973,7 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         let single = items[i].singleConnection == true
         let limit = single ? 1 : connectionLimit(for: id)
-        if inApp, connectionsInUse(id) <= limit,
+        if inApp, networkWait == nil, connectionsInUse(id) <= limit,
            let job = nextJob(at: i, steal: !single),
            let request = transferRequest(for: items[i]) {
             worker.start(part: job.part, from: job.from, end: job.end, request: request)
@@ -877,6 +1076,7 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Every part is saved: move the finished file into Downloads.
     private func completeFile(at i: Int) {
         let id = items[i].id
+        guard !delivering.contains(id) else { return }   // already being saved
         if let list = workers.removeValue(forKey: id) {
             for worker in list { worker.stop() }
         }
@@ -896,20 +1096,50 @@ final class DownloadManager: NSObject, ObservableObject {
             downloadFailed(id, message: Self.message(in: json) ?? "The server returned an error.")
             return
         }
-        let name = Self.cleanName(items[i].preferredName ?? items[i].fileName)
-        let dest = Self.uniqueURL(for: name)
-        do {
-            try FileManager.default.moveItem(at: data, to: dest)
-            try? FileManager.default.removeItem(at: Self.partsDir(id))
-            finished(id, savedName: dest.lastPathComponent, size: Self.fileSize(dest))
-        } catch {
-            mutate(id) {
-                $0.state = .failed
-                $0.status = nil
-                $0.error = "Couldn't save the file: " + error.localizedDescription
+        deliver(id, file: data, name: Self.cleanName(items[i].preferredName ?? items[i].fileName))
+    }
+
+    /// Moves a finished file to where files are saved: JDLite's Downloads folder, or the
+    /// folder you picked (copying to iCloud Drive or a USB drive can take a moment).
+    private func deliver(_ id: UUID, file: URL, name: String) {
+        guard !delivering.contains(id) else { return }
+        delivering.insert(id)
+        mutate(id, persist: false) { $0.status = "Saving…" }
+        if UIApplication.shared.applicationState == .background { beginFinishUpTime() }
+        let target = SaveLocation.shared.target()
+        Task {
+            let result = await Self.saveFinished(file, name: name, to: target)
+            self.delivering.remove(id)
+            switch result {
+            case .success(let saved):
+                try? FileManager.default.removeItem(at: Self.partsDir(id))
+                self.finished(id, saved: saved)
+            case .failure(let error):
+                self.mutate(id) {
+                    $0.state = .failed
+                    $0.status = nil
+                    $0.error = "Couldn't save the file: " + error.localizedDescription
+                }
+                self.notifyFailed(id)
+                self.startNext()
             }
-            notifyFailed(id)
-            startNext()
+        }
+    }
+
+    nonisolated static func saveFinished(_ file: URL, name: String, to target: SaveTarget) async -> Result<SavedFile, Error> {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Result<SavedFile, Error>, Never>) in
+            DownloadManager.fileQueue.async {
+                continuation.resume(returning: Result { try SaveLocation.save(file, name: name, to: target) })
+            }
+        }
+    }
+
+    /// Deletes a finished file, wherever it was saved.
+    nonisolated static func removeSaved(name: String, bookmark: Data?) {
+        if let bookmark {
+            DownloadManager.fileQueue.async { SaveLocation.deleteSaved(bookmark: bookmark) }
+        } else if !name.isEmpty {
+            try? FileManager.default.removeItem(at: downloadsDir.appendingPathComponent(name))
         }
     }
 
@@ -1149,7 +1379,7 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     private func keepResumeData(_ id: UUID, part: Int64?, data: Data?) {
-        guard let i = index(of: id), items[i].state == .paused || items[i].state == .failed else { return }
+        guard let i = index(of: id), items[i].state == .paused || items[i].state == .failed || items[i].state == .queued else { return }
         if let part {
             guard let k = items[i].segments?.firstIndex(where: { $0.start == part }) else { return }
             items[i].segments?[k].resumeData = data
@@ -1342,13 +1572,16 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// Steps that need the app itself running for a moment (iOS's downloader handles background transfers).
     private var needsAppTime: Bool {
-        !probing.isEmpty || !absorbing.isEmpty || items.contains { $0.state == .resolving && $0.torboxId == nil }
+        !probing.isEmpty || !absorbing.isEmpty || !delivering.isEmpty
+            || items.contains { $0.state == .resolving && $0.torboxId == nil }
     }
 
     /// Work that keeps JDLite awake in the background: in-app transfers, downloads waiting
     /// their turn, and links being looked up or fetched by TorBox.
     private var hasAwakeWork: Bool {
-        !workers.isEmpty || !absorbing.isEmpty || items.contains { $0.state == .queued || $0.state == .resolving }
+        let canStart = networkWait == nil
+        return !workers.isEmpty || !absorbing.isEmpty || !delivering.isEmpty
+            || items.contains { ($0.state == .queued && canStart) || $0.state == .resolving }
     }
 
     private func appWillResignActive() {
@@ -1379,7 +1612,7 @@ final class DownloadManager: NSObject, ObservableObject {
         inApp = true
         Task { for task in await checks.allTasks { task.cancel() } }   // the in-app poller takes over
         if !waitingForTorBox.isEmpty { startTorBoxPolling() }
-        startNext()
+        networkChanged()   // holds downloads if the network setting doesn't allow them, else starts the queue
         Task { await self.reclaim() }
     }
 
@@ -1410,6 +1643,7 @@ final class DownloadManager: NSObject, ObservableObject {
         guard inApp else { return }
         inApp = false
         for item in items where item.state == .downloading { handOff(item.id) }
+        if networkWait != nil { startHeldInBackground() }
         save()
     }
 
@@ -1435,7 +1669,7 @@ final class DownloadManager: NSObject, ObservableObject {
     /// faster in-app connections. Parts that got a good way finish in the background.
     private func reclaim() async {
         try? await Task.sleep(nanoseconds: 2_000_000_000)   // let fresh progress come in first
-        guard inApp, UIApplication.shared.applicationState == .active else { return }
+        guard inApp, networkWait == nil, UIApplication.shared.applicationState == .active else { return }
         let ids = Set(items.filter { $0.state == .downloading && !(bgLive[$0.id] ?? []).isEmpty }.map { $0.id })
         guard !ids.isEmpty else { return }
         var touched = Set<UUID>()
@@ -1489,7 +1723,9 @@ final class DownloadManager: NSObject, ObservableObject {
             // Replace earlier checks, then let iOS run new ones on schedule while the app sleeps.
             for task in await checks.allTasks { task.cancel() }
             for item in waiting {
-                if let webId = item.torboxId { scheduleTorBoxCheck(item.id, webId: webId, after: 20) }
+                if let webId = item.torboxId {
+                    scheduleTorBoxCheck(item.id, webId: webId, kind: item.torboxKind ?? .web, after: 20)
+                }
             }
         }
     }
@@ -1497,17 +1733,17 @@ final class DownloadManager: NSObject, ObservableObject {
     /// While the app sleeps, a small background transfer asks TorBox how it's getting on.
     /// iOS runs it around the given time and wakes JDLite with the answer, so once TorBox
     /// has the file, the download starts even with the app closed.
-    private func scheduleTorBoxCheck(_ id: UUID, webId: Int, after seconds: TimeInterval) {
-        guard let request = TorBox.shared.statusRequest(webId: webId) else { return }
+    private func scheduleTorBoxCheck(_ id: UUID, webId: Int, kind: TorBoxKind, after seconds: TimeInterval) {
+        guard let request = TorBox.shared.statusRequest(kind, id: webId) else { return }
         let task = checks.downloadTask(with: request)
         task.earliestBeginDate = Date().addingTimeInterval(seconds)
         task.countOfBytesClientExpectsToSend = 500
         task.countOfBytesClientExpectsToReceive = 10_000
-        task.taskDescription = "\(Self.checkPrefix)\n\(id.uuidString)\n\(webId)\n\(Int(seconds))"
+        task.taskDescription = "\(Self.checkPrefix)\n\(id.uuidString)\n\(webId)\n\(Int(seconds))\n\(kind.rawValue)"
         task.resume()
     }
 
-    fileprivate func torboxCheckFinished(_ id: UUID, webId: Int, interval: Int, body: Data?, status: Int) {
+    fileprivate func torboxCheckFinished(_ id: UUID, webId: Int, kind: TorBoxKind, interval: Int, body: Data?, status: Int) {
         // While the app is open (or kept awake), the regular poller handles TorBox.
         guard UIApplication.shared.applicationState == .background, !BackgroundKeeper.shared.isRunning,
               let item = items.first(where: { $0.id == id }), item.state == .resolving,
@@ -1526,21 +1762,21 @@ final class DownloadManager: NSObject, ObservableObject {
                     $0.status = dl.statusText
                     $0.cloudProgress = dl.fraction
                 }
-                scheduleTorBoxCheck(id, webId: webId, after: Self.nextCheckDelay(after: interval))
+                scheduleTorBoxCheck(id, webId: webId, kind: kind, after: Self.nextCheckDelay(after: interval))
             }
         } catch TorBoxError.gone {
             mutate(id) { $0.torboxId = nil; $0.cloudProgress = nil }
             failResolve(id, "TorBox: " + (TorBoxError.gone.errorDescription ?? "download gone"))
         } catch {
-            scheduleTorBoxCheck(id, webId: webId, after: Self.nextCheckDelay(after: interval))
+            scheduleTorBoxCheck(id, webId: webId, kind: kind, after: Self.nextCheckDelay(after: interval))
         }
     }
 
-    fileprivate func torboxCheckFailed(_ id: UUID, webId: Int, interval: Int) {
+    fileprivate func torboxCheckFailed(_ id: UUID, webId: Int, kind: TorBoxKind, interval: Int) {
         guard UIApplication.shared.applicationState == .background, !BackgroundKeeper.shared.isRunning,
               let item = items.first(where: { $0.id == id }), item.state == .resolving,
               item.torboxId == webId, item.torboxFileId == nil else { return }
-        scheduleTorBoxCheck(id, webId: webId, after: Self.nextCheckDelay(after: interval))
+        scheduleTorBoxCheck(id, webId: webId, kind: kind, after: Self.nextCheckDelay(after: interval))
     }
 
     /// The first check runs after 20 s; each later one waits twice as long, up to every 5 minutes.
@@ -1548,12 +1784,13 @@ final class DownloadManager: NSObject, ObservableObject {
         TimeInterval(min(max(previous * 2, 30), 300))
     }
 
-    nonisolated static func parseCheck(_ s: String?) -> (id: UUID, webId: Int, interval: Int)? {
+    nonisolated static func parseCheck(_ s: String?) -> (id: UUID, webId: Int, kind: TorBoxKind, interval: Int)? {
         guard let s, s.hasPrefix(checkPrefix) else { return nil }
         let lines = s.components(separatedBy: "\n")
         guard lines.count >= 4, let id = UUID(uuidString: lines[1]), let webId = Int(lines[2]),
               let interval = Int(lines[3]) else { return nil }
-        return (id: id, webId: webId, interval: interval)
+        let kind = lines.count > 4 ? (TorBoxKind(rawValue: lines[4]) ?? .web) : .web
+        return (id: id, webId: webId, kind: kind, interval: interval)
     }
 
     /// iOS cancelled background transfers on its own (app swiped away, Background App Refresh
@@ -1777,7 +2014,7 @@ final class DownloadManager: NSObject, ObservableObject {
         speeds[id] = nil
     }
 
-    fileprivate func finished(_ id: UUID, savedName: String, size: Int64) {
+    fileprivate func finished(_ id: UUID, saved: SavedFile) {
         clearTransfer(id)
         liveBytes[id] = nil
         bgLive[id] = nil
@@ -1790,15 +2027,17 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         guard items.contains(where: { $0.id == id }) else {
             // Deleted while it was finishing: don't leave the file behind.
-            try? FileManager.default.removeItem(at: Self.downloadsDir.appendingPathComponent(savedName))
+            Self.removeSaved(name: saved.name, bookmark: saved.bookmark)
             return
         }
         mutate(id) {
             $0.state = .completed
-            $0.fileName = savedName
-            $0.savedName = savedName
-            $0.bytesReceived = size
-            $0.bytesTotal = size
+            $0.fileName = saved.name
+            $0.savedName = saved.name
+            $0.savedBookmark = saved.bookmark
+            $0.savedFolder = saved.folderName
+            $0.bytesReceived = saved.size
+            $0.bytesTotal = saved.size
             $0.completedAt = Date()
             $0.error = nil
             $0.status = nil
@@ -1918,6 +2157,12 @@ final class DownloadManager: NSObject, ObservableObject {
 
     nonisolated static func partsDir(_ id: UUID) -> URL {
         partsRoot.appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    /// .torrent files waiting to be sent to TorBox.
+    nonisolated static var torrentsDir: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Torrents", isDirectory: true)
     }
 
     /// The file a download's bytes are written into while it downloads.
@@ -2063,8 +2308,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
             let body: Data? = Self.fileSize(location) < 1_000_000 ? (try? Data(contentsOf: location)) : nil
             let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
             Task { @MainActor in
-                self.torboxCheckFinished(check.id, webId: check.webId, interval: check.interval,
-                                         body: body, status: status)
+                self.torboxCheckFinished(check.id, webId: check.webId, kind: check.kind,
+                                         interval: check.interval, body: body, status: status)
             }
             return
         }
@@ -2111,14 +2356,15 @@ extension DownloadManager: URLSessionDownloadDelegate {
             return
         }
 
-        // The temp file is deleted when this method returns, so move it now.
+        // The temp file is deleted when this method returns, so move it now; it then goes
+        // where files are saved.
         let name = Self.cleanName(tag.name ?? downloadTask.response?.suggestedFilename ?? "download")
-        let dest = Self.uniqueURL(for: name)
+        let holding = Self.dataURL(id)
         do {
-            try FileManager.default.moveItem(at: location, to: dest)
-            let size = Self.fileSize(dest)
-            let finalName = dest.lastPathComponent
-            Task { @MainActor in self.finished(id, savedName: finalName, size: size) }
+            try FileManager.default.createDirectory(at: holding.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? FileManager.default.removeItem(at: holding)
+            try FileManager.default.moveItem(at: location, to: holding)
+            Task { @MainActor in self.deliver(id, file: holding, name: name) }
         } catch {
             let msg = error.localizedDescription
             Task { @MainActor in
@@ -2134,7 +2380,9 @@ extension DownloadManager: URLSessionDownloadDelegate {
         let ns = error as NSError
         if let check = Self.parseCheck(task.taskDescription) {
             if ns.code != NSURLErrorCancelled {
-                Task { @MainActor in self.torboxCheckFailed(check.id, webId: check.webId, interval: check.interval) }
+                Task { @MainActor in
+                    self.torboxCheckFailed(check.id, webId: check.webId, kind: check.kind, interval: check.interval)
+                }
             }
             return
         }

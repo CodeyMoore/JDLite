@@ -157,6 +157,12 @@ function label(c, u) {
  */
 function classify(c) {
   let u = safeURL(c.url);
+  if (u && u.protocol === "magnet:") {
+    // A torrent: JDLite sends it to TorBox, then downloads the files.
+    const dn = clean(u.searchParams.get("dn"));
+    const hash = ((u.searchParams.get("xt") || "").split(":").pop() || "").slice(0, 8);
+    return { kind: "file", url: u.href, name: dn || "Torrent " + hash, ext: "magnet", host: "torrent", size: null };
+  }
   if (!u || !/^https?:$/.test(u.protocol)) return null;
   if (NOT_DOWNLOADS.test(u.hostname)) return null;
   u = unwrap(u);

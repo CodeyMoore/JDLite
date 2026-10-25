@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     enum Sheet: Identifiable {
@@ -384,6 +385,7 @@ struct DownloadRow: View {
     private var summary: String {
         switch item.state {
         case .queued:
+            if let status = item.status { return status }   // "Waiting for Wi-Fi…"
             return item.torboxId != nil ? "Queued · via TorBox" : "Queued"
         case .resolving:
             return item.status ?? "Resolving…"
@@ -459,12 +461,14 @@ struct DownloadDetails: View {
                 }
             }
             HStack(spacing: 8) {
-                Button {
-                    UIPasteboard.general.string = (item.sourceURL ?? item.url).absoluteString
-                } label: {
-                    pill("Copy Link", "doc.on.doc")
+                if !(item.sourceURL ?? item.url).isFileURL {
+                    Button {
+                        UIPasteboard.general.string = (item.sourceURL ?? item.url).absoluteString
+                    } label: {
+                        pill("Copy Link", "doc.on.doc")
+                    }
                 }
-                if item.state == .completed {
+                if item.state == .completed && item.savedFolder == nil {
                     Button {
                         // Opens the Files app at this app's Downloads folder.
                         let path = DownloadManager.downloadsDir.path
@@ -514,9 +518,14 @@ struct DownloadDetails: View {
             r.append(DetailRow("TorBox", "\(Int(p * 100))% fetched"))
         }
         let source = item.sourceURL ?? item.url
-        r.append(DetailRow("From", (source.host ?? source.absoluteString) + (item.torboxId != nil ? " via TorBox" : "")))
+        if item.torboxKind == .torrent {
+            let kind = source.isFileURL ? ".torrent file" : (source.scheme == "magnet" ? "Magnet link" : (source.host ?? "Torrent"))
+            r.append(DetailRow("From", kind + " via TorBox"))
+        } else {
+            r.append(DetailRow("From", (source.host ?? source.absoluteString) + (item.torboxId != nil ? " via TorBox" : "")))
+        }
         if item.state == .completed, let name = item.savedFileName {
-            r.append(DetailRow("Saved as", "Downloads/\(name)"))
+            r.append(DetailRow("Saved as", (item.savedFolder ?? "Downloads") + "/" + name))
         }
         if let d = item.addedAt { r.append(DetailRow("Added", Fmt.date(d))) }
         if let d = item.completedAt { r.append(DetailRow("Finished", Fmt.date(d))) }
@@ -657,8 +666,19 @@ struct AddLinksView: View {
     @EnvironmentObject var manager: DownloadManager
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
+    @State private var pickingTorrent = false
+
+    private static let torrentType = UTType(filenameExtension: "torrent") ?? .data
 
     private var links: [URL] { DownloadManager.extractLinks(from: text) }
+
+    private var found: String {
+        let magnets = links.filter { $0.scheme?.lowercased() == "magnet" }.count
+        let total = links.count
+        var s = total == 1 ? "1 link found" : "\(total) links found"
+        if magnets > 0 { s += magnets == total ? (total == 1 ? " (a magnet link)" : " (magnet links)") : " (\(magnets) magnet)" }
+        return s
+    }
 
     var body: some View {
         NavigationStack {
@@ -667,10 +687,26 @@ struct AddLinksView: View {
                     .frame(minHeight: 180)
                     .padding(8)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-                Text("\(links.count) link(s) found").font(.footnote).foregroundStyle(.secondary)
+                Text(found).font(.footnote).foregroundStyle(.secondary)
+                Button {
+                    pickingTorrent = true
+                } label: {
+                    Label("Add .torrent Files…", systemImage: "doc.badge.plus")
+                }
+                .padding(.top, 8)
+                Text("Magnet links and .torrent files download through TorBox.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 Spacer()
             }
             .padding()
+            .fileImporter(isPresented: $pickingTorrent, allowedContentTypes: [Self.torrentType],
+                          allowsMultipleSelection: true) { result in
+                if case .success(let urls) = result, !urls.isEmpty {
+                    for url in urls { manager.importFile(url) }
+                    dismiss()
+                }
+            }
             .navigationTitle("Add links")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

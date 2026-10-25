@@ -8,6 +8,24 @@ struct TorBoxFile {
     var size: Int64?
 }
 
+/// What TorBox fetches: a link from a file host, or a torrent (magnet link or .torrent file).
+enum TorBoxKind: String, Codable, Hashable, Sendable {
+    case web, torrent
+
+    /// The API's folder for this kind: webdl/... or torrents/...
+    var path: String { self == .web ? "webdl" : "torrents" }
+    /// The ID parameter its download links use.
+    var idParam: String { self == .web ? "web_id" : "torrent_id" }
+}
+
+/// A file sent in a multipart form (a .torrent upload).
+struct FormFile {
+    var field: String
+    var name: String
+    var type: String
+    var data: Data
+}
+
 struct TorBoxWebDownload {
     var ready: Bool
     var failure: String?
@@ -26,7 +44,12 @@ struct TorBoxWebDownload {
             let pct = Int((p <= 1 ? p * 100 : p).rounded())
             return "TorBox is fetching it… \(min(pct, 100))%"
         }
-        return state.isEmpty ? "Waiting for TorBox…" : "TorBox: \(state)"
+        let lower = state.lowercased()
+        if lower.isEmpty { return "Waiting for TorBox…" }
+        if lower == "metadl" { return "TorBox is getting the torrent's details…" }
+        if lower.contains("stalled") { return "TorBox: no seeds yet, still trying…" }
+        if lower.contains("queued") { return "TorBox: queued…" }
+        return "TorBox: \(state)"
     }
 }
 
@@ -155,17 +178,20 @@ final class TorBox: ObservableObject {
         supportedSiteCount = list.count
     }
 
-    // MARK: Web downloads
+    // MARK: Adding links and torrents
 
-    /// Adds a link to TorBox and returns its web download ID.
-    func create(link: URL) async throws -> Int {
-        // TorBox rate-limits this endpoint, so space requests out.
+    /// TorBox rate-limits adding downloads, so requests are spaced out.
+    private func waitForAddSlot() async {
         let now = Date()
         let slot = max(now, nextCreateAt)
         nextCreateAt = slot.addingTimeInterval(1.5)
         let wait = slot.timeIntervalSince(now)
         if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+    }
 
+    /// Adds a file-host link to TorBox and returns its web download ID.
+    func create(link: URL) async throws -> Int {
+        await waitForAddSlot()
         let data = try await call("POST", "webdl/createwebdownload", form: ["link": link.absoluteString])
         let object = data as? [String: Any]
         guard let id = Self.int(object?["webdownload_id"]) ?? Self.int(object?["id"]) else {
@@ -174,17 +200,43 @@ final class TorBox: ObservableObject {
         return id
     }
 
-    func webDownload(id: Int) async throws -> TorBoxWebDownload {
-        let data = try await call("GET", "webdl/mylist", query: [
+    /// Adds a magnet link to TorBox and returns its torrent ID.
+    func createTorrent(magnet: String) async throws -> Int {
+        await waitForAddSlot()
+        let data = try await call("POST", "torrents/createtorrent", form: ["magnet": magnet])
+        return try Self.torrentID(in: data)
+    }
+
+    /// Uploads a .torrent file to TorBox and returns its torrent ID.
+    func createTorrent(file: Data, name: String) async throws -> Int {
+        await waitForAddSlot()
+        let upload = FormFile(field: "file", name: name.hasSuffix(".torrent") ? name : name + ".torrent",
+                              type: "application/x-bittorrent", data: file)
+        let data = try await call("POST", "torrents/createtorrent", form: [:], files: [upload])
+        return try Self.torrentID(in: data)
+    }
+
+    private static func torrentID(in data: Any?) throws -> Int {
+        let object = data as? [String: Any]
+        guard let id = int(object?["torrent_id"]) ?? int(object?["id"]) else {
+            throw TorBoxError.api("TorBox didn't return a torrent ID.")
+        }
+        return id
+    }
+
+    // MARK: Status
+
+    func status(_ kind: TorBoxKind, id: Int) async throws -> TorBoxWebDownload {
+        let data = try await call("GET", kind.path + "/mylist", query: [
             URLQueryItem(name: "id", value: String(id)),
             URLQueryItem(name: "bypass_cache", value: "true")
         ])
         return try Self.parseWebDownload(data, id: id)
     }
 
-    /// The status of every web download on the account, by ID: one request for many links.
-    func webDownloadList() async throws -> [Int: TorBoxWebDownload] {
-        let data = try await call("GET", "webdl/mylist", query: [URLQueryItem(name: "bypass_cache", value: "true")])
+    /// The status of every download of one kind on the account, by ID: one request for many.
+    func statusList(_ kind: TorBoxKind) async throws -> [Int: TorBoxWebDownload] {
+        let data = try await call("GET", kind.path + "/mylist", query: [URLQueryItem(name: "bypass_cache", value: "true")])
         var out: [Int: TorBoxWebDownload] = [:]
         for entry in (data as? [[String: Any]]) ?? [] {
             guard let id = Self.int(entry["id"]), let dl = try? Self.parseWebDownload(entry, id: id) else { continue }
@@ -194,11 +246,11 @@ final class TorBox: ObservableObject {
     }
 
     /// The same status request as a plain URLRequest, for background checks while the app sleeps.
-    func statusRequest(webId: Int) -> URLRequest? {
+    func statusRequest(_ kind: TorBoxKind, id: Int) -> URLRequest? {
         guard let key else { return nil }
-        var comps = URLComponents(string: Self.base + "webdl/mylist")
+        var comps = URLComponents(string: Self.base + kind.path + "/mylist")
         comps?.queryItems = [
-            URLQueryItem(name: "id", value: String(webId)),
+            URLQueryItem(name: "id", value: String(id)),
             URLQueryItem(name: "bypass_cache", value: "true")
         ]
         guard let url = comps?.url else { return nil }
@@ -256,12 +308,12 @@ final class TorBox: ObservableObject {
 
     /// A permanent TorBox link that redirects to a fresh download URL each time,
     /// so queued, paused and retried downloads never use an expired link.
-    func permalink(webId: Int, fileId: Int) -> URL? {
+    func permalink(_ kind: TorBoxKind, id: Int, fileId: Int) -> URL? {
         guard let key else { return nil }
-        var comps = URLComponents(string: Self.base + "webdl/requestdl")
+        var comps = URLComponents(string: Self.base + kind.path + "/requestdl")
         comps?.queryItems = [
             URLQueryItem(name: "token", value: key),
-            URLQueryItem(name: "web_id", value: String(webId)),
+            URLQueryItem(name: kind.idParam, value: String(id)),
             URLQueryItem(name: "file_id", value: String(fileId)),
             URLQueryItem(name: "zip_link", value: "false"),
             URLQueryItem(name: "redirect", value: "true")
@@ -274,6 +326,7 @@ final class TorBox: ObservableObject {
     private func call(_ method: String, _ path: String,
                       query: [URLQueryItem] = [],
                       form: [String: String]? = nil,
+                      files: [FormFile] = [],
                       key overrideKey: String? = nil,
                       auth: Bool = true) async throws -> Any? {
         var comps = URLComponents(string: Self.base + path)
@@ -288,12 +341,18 @@ final class TorBox: ObservableObject {
             guard let k = overrideKey ?? key else { throw TorBoxError.noKey }
             req.setValue("Bearer \(k)", forHTTPHeaderField: "Authorization")
         }
-        if let form {
+        if form != nil || !files.isEmpty {
             let boundary = "JDLite-\(UUID().uuidString)"
             req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
             var body = Data()
-            for (name, value) in form {
+            for (name, value) in form ?? [:] {
                 body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8))
+            }
+            for file in files {
+                let safeName = file.name.replacingOccurrences(of: "\"", with: "'")
+                body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(file.field)\"; filename=\"\(safeName)\"\r\nContent-Type: \(file.type)\r\n\r\n".utf8))
+                body.append(file.data)
+                body.append(Data("\r\n".utf8))
             }
             body.append(Data("--\(boundary)--\r\n".utf8))
             req.httpBody = body
