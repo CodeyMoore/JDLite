@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
@@ -7,7 +6,6 @@ struct SettingsView: View {
     @ObservedObject private var location = SaveLocation.shared
     @ObservedObject private var network = NetworkMonitor.shared
     @Environment(\.dismiss) private var dismiss
-    @State private var pickingFolder = false
     @State private var folderError: String?
 
     var body: some View {
@@ -50,20 +48,28 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Picker("Save Files To", selection: $location.useChosenFolder) {
-                        Text("JDLite's Downloads Folder").tag(false)
-                        Text(location.folderName ?? "A Folder You Choose").tag(true)
+                    Button {
+                        location.useChosenFolder = false
+                    } label: {
+                        locationRow("JDLite's Downloads Folder", symbol: "arrow.down.circle", chosen: !location.useChosenFolder)
                     }
-                    if location.useChosenFolder {
-                        Button(location.folderName == nil ? "Choose Folder…" : "Change Folder…") { pickingFolder = true }
+                    if let name = location.folderName {
+                        Button {
+                            location.useChosenFolder = true
+                        } label: {
+                            locationRow(name, symbol: "folder", chosen: location.useChosenFolder)
+                        }
+                    }
+                    Button(location.folderName == nil ? "Choose a Folder…" : "Choose a Different Folder…") {
+                        pickFolder()
                     }
                     if let folderError {
                         Text(folderError).foregroundStyle(.red)
                     }
                 } header: {
-                    Text("Save Location")
+                    Text("Save Files To")
                 } footer: {
-                    Text("Finished files go to JDLite's Downloads folder (Files › On My iPhone › JDLite), or to a folder you choose, such as one in iCloud Drive or on a USB drive. If that folder isn't available when a download finishes, the file goes to JDLite's Downloads folder instead.")
+                    Text("Tap Choose a Folder, go into the folder you want (for example in iCloud Drive or on a USB drive), then tap Open. If that folder isn't available when a download finishes, the file goes to JDLite's Downloads folder (Files › On My iPhone › JDLite) instead.")
                 }
 
                 Section {
@@ -84,32 +90,38 @@ struct SettingsView: View {
                     Text("Shows download progress on the Lock Screen and in the Dynamic Island.")
                 }
             }
-            .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
-                switch result {
-                case .success(let url):
-                    do {
-                        try location.choose(url)
-                        folderError = nil
-                    } catch {
-                        folderError = "Couldn't use that folder: \(error.localizedDescription)"
-                    }
-                case .failure(let error):
-                    folderError = "Couldn't open that folder: \(error.localizedDescription)"
-                }
-            }
-            .onChange(of: location.useChosenFolder) { _, chosen in
-                if chosen && location.folderName == nil { pickingFolder = true }
-            }
-            .onChange(of: pickingFolder) { _, open in
-                // Closed the picker without choosing a folder: stay with the Downloads folder.
-                if !open && location.folderName == nil { location.useChosenFolder = false }
-            }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
         }
+    }
+
+    private func pickFolder() {
+        FolderPicker.shared.present { url in
+            guard let url else { return }   // cancelled: nothing changes
+            do {
+                try location.choose(url)
+                folderError = nil
+            } catch {
+                folderError = "Couldn't use that folder: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func locationRow(_ title: String, symbol: String, chosen: Bool) -> some View {
+        HStack {
+            Label(title, systemImage: symbol)
+                .foregroundStyle(.primary)
+            Spacer()
+            if chosen {
+                Image(systemName: "checkmark")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.tint)
+            }
+        }
+        .contentShape(Rectangle())
     }
 
     private var connectionName: String {
