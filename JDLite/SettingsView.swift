@@ -1,17 +1,10 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var system = SystemStatus.shared
-    @ObservedObject private var location = SaveLocation.shared
     @ObservedObject private var network = NetworkMonitor.shared
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject private var pickerLog = PickerLog.shared
-    @State private var folderError: String?
-    @State private var folderPick: FilesPickRequest?
-    @State private var offerOtherWay = false    // after a cancel: maybe Open didn't work
-    @State private var testingWithFile = false
 
     var body: some View {
         NavigationStack {
@@ -46,49 +39,19 @@ struct SettingsView: View {
                         }
                     }
                     LabeledContent("Connected To", value: connectionName)
+                    Toggle("Retry Failed Downloads", isOn: $settings.autoRetry)
                 } header: {
                     Text("Network")
                 } footer: {
-                    Text("With Wi-Fi Only, downloads wait while you're on mobile data and carry on by themselves when you're back on Wi-Fi. iOS always uses Wi-Fi when it's connected, so with Mobile Data Only, downloads wait while you're on Wi-Fi.")
+                    Text("With Wi-Fi Only, downloads wait while you're on mobile data and carry on by themselves when you're back on Wi-Fi. iOS always uses Wi-Fi when it's connected, so with Mobile Data Only, downloads wait while you're on Wi-Fi.\n\nWith Retry Failed Downloads on, a download that fails because the connection dropped tries again by itself: after 10 seconds, then waiting longer each time, up to 5 times. If there's no network, it waits until there is.")
                 }
 
                 Section {
-                    Button {
-                        location.useChosenFolder = false
-                    } label: {
-                        locationRow("JDLite's Downloads Folder", symbol: "arrow.down.circle", chosen: !location.useChosenFolder)
-                    }
-                    if let name = location.folderName {
-                        Button {
-                            location.useChosenFolder = true
-                        } label: {
-                            locationRow(name, symbol: "folder", chosen: location.useChosenFolder)
-                        }
-                    }
-                    Button(location.folderName == nil ? "Choose a Folder…" : "Choose a Different Folder…") {
-                        chooseFolder(selecting: false)
-                    }
-                    if offerOtherWay {
-                        Button("Choose It Another Way…") {
-                            chooseFolder(selecting: true)
-                        }
-                        Button("Test the Picker With a File…") {
-                            testWithFile()
-                        }
-                    }
-                    if let folderError {
-                        Text(folderError).foregroundStyle(.red)
-                    }
-                    if !pickerLog.lines.isEmpty {
-                        Text(pickerLog.lines.joined(separator: "\n"))
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
+                    Toggle("Choose Files in Torrents", isOn: $settings.askTorrentFiles)
                 } header: {
-                    Text("Save Files To")
+                    Text("Torrents")
                 } footer: {
-                    Text(offerOtherWay ? Self.otherWayHelp : Self.folderHelp)
+                    Text("When a torrent has more than one file, JDLite asks which ones to download once TorBox has it. A torrent's files go into a folder named after it in Downloads, laid out as in the torrent, and show as one group in the list.")
                 }
 
                 Section {
@@ -111,15 +74,7 @@ struct SettingsView: View {
 
                 Section {
                     LabeledContent("Version", value: Self.versionText)
-                    LabeledContent("Bundle ID", value: AppIdentity.bundleID)
-                    LabeledContent("Signed As", value: AppIdentity.signedAs)
-                    LabeledContent("Added Libraries", value: AppIdentity.addedLibraries)
-                } header: {
-                    Text("This Install")
                 }
-            }
-            .filesPicker($folderPick) { urls in
-                folderPicked(urls)
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -129,77 +84,11 @@ struct SettingsView: View {
         }
     }
 
-    private static let folderHelp = "Tap Choose a Folder, go into the folder you want (for example in iCloud Drive or on a USB drive), then tap Open. If that folder isn't available when a download finishes, the file goes to JDLite's Downloads folder (Files › On My iPhone › JDLite) instead."
-
-    private static let otherWayHelp = "If Open didn't do anything, tap Choose It Another Way. Go to the folder that holds the one you want, select that folder (tap Select first if you see it), then tap Open.\n\nTest the Picker With a File checks whether the picker can hand anything to JDLite: pick any file (nothing is changed or copied). The grey lines above show what the picker did."
-
-    /// Opens the Files picker for a folder. Normally you go into the folder and tap Open; with
-    /// `selecting`, you select the folder from the one above it instead.
-    private func chooseFolder(selecting: Bool) {
-        folderError = nil
-        testingWithFile = false
-        pickerLog.add(selecting ? "— Choose It Another Way —" : "— Choose a Folder —")
-        folderPick = FilesPickRequest(types: [.folder], multiple: selecting, logs: true)
-    }
-
-    /// Checks whether the picker can hand anything over, using a file instead of a folder.
-    private func testWithFile() {
-        folderError = nil
-        testingWithFile = true
-        pickerLog.add("— Test With a File —")
-        folderPick = FilesPickRequest(types: [.item], logs: true)
-    }
-
-    private func folderPicked(_ urls: [URL]) {
-        if testingWithFile {
-            testingWithFile = false
-            pickerLog.add(urls.isEmpty ? "Test: no file came through" : "Test: the picker handed over \(urls[0].lastPathComponent)")
-            return
-        }
-        guard let url = urls.first else {
-            offerOtherWay = true   // cancelled: maybe because Open didn't work
-            return
-        }
-        // The picker also lets .torrent files be picked (JDLite opens them), so check it's a folder.
-        let scoped = url.startAccessingSecurityScopedResource()
-        let isFolder = url.hasDirectoryPath
-            || (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-        if scoped { url.stopAccessingSecurityScopedResource() }
-        guard isFolder else {
-            folderError = "That's a file, not a folder. Pick a folder instead."
-            pickerLog.add("Not a folder")
-            return
-        }
-        do {
-            try location.choose(url)
-            folderError = nil
-            offerOtherWay = false
-            pickerLog.add("Saving files to \(url.lastPathComponent)")
-        } catch {
-            folderError = "Couldn't use that folder: \(error.localizedDescription)"
-            pickerLog.add("Couldn't keep access: \(error.localizedDescription)")
-        }
-    }
-
     private static var versionText: String {
         let info = Bundle.main.infoDictionary
         let version = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
         return "\(version) (\(build))"
-    }
-
-    private func locationRow(_ title: String, symbol: String, chosen: Bool) -> some View {
-        HStack {
-            Label(title, systemImage: symbol)
-                .foregroundStyle(.primary)
-            Spacer()
-            if chosen {
-                Image(systemName: "checkmark")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(.tint)
-            }
-        }
-        .contentShape(Rectangle())
     }
 
     private var connectionName: String {

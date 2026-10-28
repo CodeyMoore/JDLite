@@ -2,6 +2,7 @@ import SwiftUI
 
 struct TorBoxView: View {
     @ObservedObject private var torbox = TorBox.shared
+    @ObservedObject private var settings = AppSettings.shared
     @Environment(\.dismiss) private var dismiss
     @State private var keyText = ""
     @State private var working = false
@@ -20,6 +21,7 @@ struct TorBoxView: View {
                         Text(torbox.accountSummary ?? "Checking…")
                             .foregroundStyle(.secondary)
                         Toggle("Use TorBox for supported sites", isOn: $torbox.enabled)
+                        Toggle("Remove From TorBox When Done", isOn: $settings.removeFromTorBox)
                         Link(destination: Self.hostersPage) {
                             HStack {
                                 Label("Tap here for supported TorBox hosters", systemImage: "list.bullet.rectangle")
@@ -33,7 +35,7 @@ struct TorBoxView: View {
                     } header: {
                         Text("Account")
                     } footer: {
-                        Text("Links from supported sites download through your TorBox account. TorBox may ask you to log in to see the list.")
+                        Text("Links from supported sites download through your TorBox account. TorBox may ask you to log in to see the list.\n\nWith Remove From TorBox When Done, a download is deleted from your TorBox account once all its files are on this device. See what's on TorBox in ⋯ › TorBox Cloud.")
                     }
                 }
                 Section {

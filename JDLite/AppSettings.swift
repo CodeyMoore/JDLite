@@ -47,6 +47,21 @@ final class AppSettings: ObservableObject {
     /// The speed limit slider's stops, in MB/s, slowest first. 0 (the last stop) means unlimited.
     static let speedLimitSteps: [Double] = [0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 0]
 
+    /// Ask which files to download when a torrent has more than one.
+    @Published var askTorrentFiles: Bool {
+        didSet { defaults.set(askTorrentFiles, forKey: "askTorrentFiles") }
+    }
+
+    /// Downloads that fail because the connection dropped try again by themselves.
+    @Published var autoRetry: Bool {
+        didSet { defaults.set(autoRetry, forKey: "autoRetry") }
+    }
+
+    /// Delete downloads from your TorBox account once all their files are downloaded.
+    @Published var removeFromTorBox: Bool {
+        didSet { defaults.set(removeFromTorBox, forKey: "removeFromTorBox") }
+    }
+
     /// Notify when downloads finish or fail while the app isn't open.
     @Published var notificationsEnabled: Bool {
         didSet {
@@ -78,6 +93,9 @@ final class AppSettings: ObservableObject {
         let limit = d.object(forKey: "speedLimit") as? Double ?? 0
         _speedLimit = Published(wrappedValue: max(limit, 0))
         SpeedLimiter.shared.setLimit(bytesPerSecond: max(limit, 0) * 1_000_000)
+        _askTorrentFiles = Published(wrappedValue: d.object(forKey: "askTorrentFiles") as? Bool ?? true)
+        _autoRetry = Published(wrappedValue: d.object(forKey: "autoRetry") as? Bool ?? true)
+        _removeFromTorBox = Published(wrappedValue: d.object(forKey: "removeFromTorBox") as? Bool ?? false)
         _notificationsEnabled = Published(wrappedValue: d.object(forKey: "notificationsEnabled") as? Bool ?? true)
         _liveActivityEnabled = Published(wrappedValue: d.object(forKey: "liveActivityEnabled") as? Bool ?? true)
     }

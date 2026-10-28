@@ -3,8 +3,9 @@ import UIKit
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    enum Sheet: Identifiable {
-        case add, torbox, plugins, settings
+    enum Sheet: Identifiable, Hashable {
+        case add, torbox, cloud, plugins, settings
+        case chooseFiles(UUID)
         var id: Self { self }
     }
 
@@ -15,18 +16,24 @@ struct ContentView: View {
     @State private var selection = Set<UUID>()
     @State private var pendingDelete = Set<UUID>()
     @State private var confirmingDelete = false
+    @State private var expandedGroups = Set<UUID>()
+    @State private var searchText = ""
+    @State private var repeatLinks: [URL] = []
+    @State private var askingAboutRepeats = false
     @AppStorage("sortOrder") private var sortOrder: SortOrder = .oldest
     @AppStorage("statusFilter") private var statusFilter: StatusFilter = .all
     @AppStorage("typeFilter") private var typeFilter: String = "all"
 
     private var isEditing: Bool { editMode.isEditing }
     private var isFiltering: Bool { statusFilter != .all || typeFilter != "all" }
+    private var query: String { searchText.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-    /// The downloads after the filter, sorted by when they were added.
+    /// The downloads after the filter and search, sorted by when each was added.
     private var visibleItems: [DownloadItem] {
         let filtered = manager.items.enumerated().filter { pair in
             statusFilter.matches(pair.element)
                 && (typeFilter == "all" || FileKind.of(pair.element.fileName).rawValue == typeFilter)
+                && matchesSearch(pair.element)
         }
         let newestFirst = sortOrder == .newest
         return filtered.sorted { a, b in
@@ -38,8 +45,48 @@ struct ContentView: View {
         .map { $0.element }
     }
 
+    private func matchesSearch(_ item: DownloadItem) -> Bool {
+        let text = query
+        guard !text.isEmpty else { return true }
+        if item.fileName.localizedCaseInsensitiveContains(text) { return true }
+        if let group = item.groupName, group.localizedCaseInsensitiveContains(text) { return true }
+        if let host = (item.sourceURL ?? item.url).host, host.localizedCaseInsensitiveContains(text) { return true }
+        return false
+    }
+
+    /// The list's rows: downloads, with a torrent's files shown as one group row (followed by
+    /// its files while the group is open).
+    private func listRows(_ visible: [DownloadItem]) -> [ListRow] {
+        var members: [UUID: [DownloadItem]] = [:]
+        for item in manager.items {
+            if let group = item.groupID { members[group, default: []].append(item) }
+        }
+        var shown: [UUID: [DownloadItem]] = [:]
+        for item in visible {
+            if let group = item.groupID { shown[group, default: []].append(item) }
+        }
+        var rows: [ListRow] = []
+        var placed = Set<UUID>()
+        for item in visible {
+            guard let group = item.groupID, let all = members[group], all.count > 1 else {
+                rows.append(.item(item, false))
+                continue
+            }
+            guard placed.insert(group).inserted else { continue }
+            let files = (shown[group] ?? []).sorted {
+                $0.sortPath.localizedStandardCompare($1.sortPath) == .orderedAscending
+            }
+            rows.append(.group(TorrentGroup(id: group, name: item.groupName ?? item.fileName,
+                                            members: all, shown: files)))
+            if expandedGroups.contains(group) && !isEditing {
+                for file in files { rows.append(.item(file, true)) }
+            }
+        }
+        return rows
+    }
+
     private var allSelected: Bool {
-        let ids = Set(visibleItems.map(\.id))
+        let ids = Set(listRows(visibleItems).map { $0.id })
         return !ids.isEmpty && ids.isSubset(of: selection)
     }
 
@@ -52,6 +99,7 @@ struct ContentView: View {
                                            description: Text("Tap + to paste links, or send them from Safari."))
                 } else {
                     let visible = visibleItems
+                    let rows = listRows(visible)
                     List(selection: $selection) {
                         if !isEditing && !system.backgroundRefreshOn {
                             BackgroundWarning(lowPower: system.lowPowerMode) { system.openAppSettings() }
@@ -59,33 +107,29 @@ struct ContentView: View {
                         if !isEditing && isFiltering && !visible.isEmpty {
                             FilterSummary(text: filterSummary, count: visible.count) { clearFilters() }
                         }
-                        ForEach(visible) { item in
-                            DownloadRow(item: item, speed: manager.speeds[item.id])
-                                .tag(item.id)
-                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                    Button {
-                                        askToDelete([item.id])
-                                    } label: {
-                                        Label("Delete", systemImage: "trash")
-                                    }
-                                    .tint(.red)
-                                }
+                        ForEach(rows) { row in
+                            rowView(row)
                         }
                     }
                     .listStyle(.plain)
                     .overlay {
                         if visible.isEmpty {
-                            ContentUnavailableView {
-                                Label("No matching downloads", systemImage: "line.3.horizontal.decrease.circle")
-                            } description: {
-                                Text("Nothing matches the filter you picked.")
-                            } actions: {
-                                Button("Show Everything") { clearFilters() }
+                            if !query.isEmpty {
+                                ContentUnavailableView.search(text: query)
+                            } else {
+                                ContentUnavailableView {
+                                    Label("No matching downloads", systemImage: "line.3.horizontal.decrease.circle")
+                                } description: {
+                                    Text("Nothing matches the filter you picked.")
+                                } actions: {
+                                    Button("Show Everything") { clearFilters() }
+                                }
                             }
                         }
                     }
                 }
             }
+            .searchable(text: $searchText, prompt: "Search downloads")
             .environment(\.editMode, $editMode)
             .navigationTitle("JDLite")
             .toolbar { toolbarContent }
@@ -93,7 +137,9 @@ struct ContentView: View {
                 Button("Delete", role: .destructive) {
                     let ids = pendingDelete
                     manager.delete(ids)
-                    selection.subtract(ids)
+                    selection = selection.filter { id in
+                        manager.items.contains { $0.id == id || $0.groupID == id }
+                    }
                     pendingDelete = []
                     if manager.items.isEmpty { editMode = .inactive }
                 }
@@ -105,12 +151,99 @@ struct ContentView: View {
                 switch s {
                 case .add: AddLinksView()
                 case .torbox: TorBoxView()
+                case .cloud: TorBoxCloudView()
                 case .plugins: PluginsView()
                 case .settings: SettingsView()
+                case .chooseFiles(let id):
+                    ChooseFilesSheet(itemID: id, item: manager.items.first(where: { $0.id == id }))
                 }
             }
             .task { await PluginHost.shared.ensureLoaded() }
         }
+        .onChange(of: manager.repeatedLinks, initial: true) { _, links in
+            // Links from Safari or the share sheet that were already in the list.
+            guard !links.isEmpty else { return }
+            repeatLinks = links
+            askingAboutRepeats = true
+            manager.clearRepeatedLinks()
+        }
+        .confirmationDialog(repeatTitle, isPresented: $askingAboutRepeats, titleVisibility: .visible,
+                            presenting: repeatLinks) { links in
+            Button(links.count == 1 ? "Add It Again" : "Add Them Again") {
+                manager.add(urls: links, allowDuplicates: true)
+            }
+            Button("Skip", role: .cancel) {}
+        } message: { links in
+            Text(links.count == 1
+                 ? "That link is already in your list."
+                 : "These links are already in your list.")
+        }
+    }
+
+    /// One row of the list: a download, or a torrent's group row.
+    @ViewBuilder
+    private func rowView(_ row: ListRow) -> some View {
+        switch row {
+        case .item(let item, let inGroup):
+            DownloadRow(item: item, speed: manager.speeds[item.id], inGroup: inGroup) {
+                sheet = .chooseFiles(item.id)
+            }
+            .tag(item.id)
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button {
+                    askToDelete([item.id])
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+                .tint(.red)
+            }
+        case .group(let group):
+            GroupRow(group: group, speeds: manager.speeds, expanded: expandedGroups.contains(group.id)) {
+                toggleGroup(group.id)
+            }
+            .tag(group.id)
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button {
+                    askToDelete([group.id])
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+                .tint(.red)
+            }
+            .contextMenu { groupMenu(group) }
+        }
+    }
+
+    private var repeatTitle: String {
+        repeatLinks.count == 1 ? "Already in your list" : "\(repeatLinks.count) links are already in your list"
+    }
+
+    private func toggleGroup(_ id: UUID) {
+        withAnimation(.snappy) {
+            if expandedGroups.contains(id) {
+                expandedGroups.remove(id)
+            } else {
+                expandedGroups.insert(id)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func groupMenu(_ group: TorrentGroup) -> some View {
+        let ids = Set(group.members.map { $0.id })
+        if group.members.contains(where: { $0.state == .completed }), let folder = group.folderURL {
+            Button("Show in Files", systemImage: "folder") { FilesApp.open(folder) }
+        }
+        if group.members.contains(where: { $0.state == .queued || $0.state == .resolving || $0.state == .downloading }) {
+            Button("Pause", systemImage: "pause.circle") { manager.pauseAll(ids) }
+        }
+        if group.members.contains(where: { $0.state == .paused }) {
+            Button("Resume", systemImage: "play.circle") { manager.resumeAll(ids) }
+        }
+        if group.members.contains(where: { $0.state == .failed }) {
+            Button("Retry Failed Files", systemImage: "arrow.clockwise") { manager.retryFailed(ids) }
+        }
+        Button("Delete…", systemImage: "trash", role: .destructive) { askToDelete([group.id]) }
     }
 
     @ToolbarContentBuilder
@@ -118,7 +251,7 @@ struct ContentView: View {
         if isEditing {
             ToolbarItem(placement: .topBarLeading) {
                 Button(allSelected ? "Deselect All" : "Select All") {
-                    selection = allSelected ? [] : Set(visibleItems.map(\.id))
+                    selection = allSelected ? [] : Set(listRows(visibleItems).map { $0.id })
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
@@ -141,8 +274,17 @@ struct ContentView: View {
             ToolbarItem(placement: .topBarLeading) {
                 Menu {
                     Button("TorBox", systemImage: "cloud") { sheet = .torbox }
+                    Button("TorBox Cloud", systemImage: "icloud.and.arrow.down") { sheet = .cloud }
                     Button("Plugins", systemImage: "puzzlepiece.extension") { sheet = .plugins }
                     Button("Settings", systemImage: "gearshape") { sheet = .settings }
+                    Divider()
+                    Button("Pause All", systemImage: "pause.circle") { manager.pauseAll() }
+                        .disabled(!manager.canPauseAll)
+                    Button("Resume All", systemImage: "play.circle") { manager.resumeAll() }
+                        .disabled(!manager.canResumeAll)
+                    if manager.hasFailed {
+                        Button("Retry Failed", systemImage: "arrow.clockwise.circle") { manager.retryFailed() }
+                    }
                     Divider()
                     Button("Select Downloads", systemImage: "checkmark.circle") { editMode = .active }
                         .disabled(manager.items.isEmpty)
@@ -226,9 +368,13 @@ struct ContentView: View {
 
     // MARK: Deleting
 
+    /// Asks before deleting. A group row stands for all of its torrent's files.
     private func askToDelete(_ ids: Set<UUID>) {
-        guard !ids.isEmpty else { return }
-        pendingDelete = ids
+        let files = Set(manager.items.filter { item in
+            ids.contains(item.id) || (item.groupID.map { ids.contains($0) } ?? false)
+        }.map { $0.id })
+        guard !files.isEmpty else { return }
+        pendingDelete = files
         confirmingDelete = true
     }
 
@@ -237,6 +383,10 @@ struct ContentView: View {
     private var deleteTitle: String {
         let items = pendingItems
         if items.count == 1 { return "Delete “\(items[0].fileName)”?" }
+        if let group = items.first?.groupID, items.allSatisfy({ $0.groupID == group }),
+           items.count == manager.items.filter({ $0.groupID == group }).count {
+            return "Delete “\(items[0].groupName ?? items[0].fileName)”?"   // a whole torrent
+        }
         return "Delete \(items.count) downloads?"
     }
 
@@ -301,6 +451,204 @@ private struct FilterSummary: View {
     }
 }
 
+// MARK: - Torrent groups
+
+/// A row of the list: a download, or a torrent whose files show as one group.
+enum ListRow: Identifiable {
+    case item(DownloadItem, Bool)    // a download, and whether it's shown inside its torrent's group
+    case group(TorrentGroup)
+
+    var id: UUID {
+        switch self {
+        case .item(let item, _): return item.id
+        case .group(let group): return group.id
+        }
+    }
+}
+
+/// A torrent whose files show as one row in the list.
+struct TorrentGroup {
+    let id: UUID
+    let name: String
+    let members: [DownloadItem]      // every file of the torrent in the list
+    let shown: [DownloadItem]        // the ones the filter and search let through
+
+    /// The torrent's folder in Downloads.
+    var folderURL: URL? {
+        guard let root = members.compactMap({ $0.folder }).first?.split(separator: "/").first else { return nil }
+        return DownloadManager.downloadsDir.appendingPathComponent(String(root), isDirectory: true)
+    }
+}
+
+extension DownloadItem {
+    /// Sorts a torrent's files the way the torrent lays them out.
+    var sortPath: String { (folder ?? "") + "/" + fileName }
+}
+
+/// Opens the Files app at a folder in JDLite's storage.
+@MainActor
+enum FilesApp {
+    static func open(_ folder: URL) {
+        let path = folder.path
+        let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+        if let url = URL(string: "shareddocuments://" + encoded) {
+            UIApplication.shared.open(url)
+        }
+    }
+}
+
+/// A torrent's files as one row: combined progress, and a button to show the files.
+struct GroupRow: View {
+    @EnvironmentObject var manager: DownloadManager
+    @Environment(\.editMode) private var editMode
+    let group: TorrentGroup
+    let speeds: [UUID: Double]
+    let expanded: Bool
+    let toggle: () -> Void
+
+    private var editing: Bool { editMode?.wrappedValue.isEditing == true }
+    private var members: [DownloadItem] { group.members }
+    private var done: Int { members.filter { $0.state == .completed }.count }
+    private var failed: Int { members.filter { $0.state == .failed }.count }
+    private var paused: Int { members.filter { $0.state == .paused }.count }
+    private var waiting: Int {
+        members.filter { $0.state == .queued || $0.state == .resolving || $0.state == .downloading }.count
+    }
+    private var downloading: Bool { members.contains { $0.state == .downloading } }
+    private var allDone: Bool { done == members.count }
+    private var totalBytes: Int64 { members.reduce(Int64(0)) { $0 + max($1.bytesTotal, 0) } }
+    private var receivedBytes: Int64 {
+        members.reduce(Int64(0)) { $0 + ($1.state == .completed ? max($1.bytesTotal, $1.bytesReceived) : $1.bytesReceived) }
+    }
+    private var speed: Double { members.reduce(0.0) { $0 + (speeds[$1.id] ?? 0) } }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ZStack(alignment: .bottomTrailing) {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(tint.opacity(0.14))
+                    .frame(width: 42, height: 42)
+                    .overlay(
+                        Image(systemName: "folder.fill")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(tint)
+                    )
+                if allDone {
+                    Image(systemName: "checkmark.circle.fill")
+                        .symbolRenderingMode(.palette)
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(Color.white, Color.green)
+                        .background(Circle().fill(Color(.systemBackground)).padding(-1.5))
+                        .offset(x: 4, y: 4)
+                }
+            }
+            .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(group.name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if !allDone && (totalBytes > 0 || downloading) {
+                    ProgressBar(fraction: totalBytes > 0 ? min(Double(receivedBytes) / Double(totalBytes), 1) : nil,
+                                tint: downloading ? Color.accentColor : (failed > 0 ? Color.red : Color.gray))
+                }
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(failed > 0 && waiting == 0 ? Color.red : Color.secondary)
+                    .lineLimit(2)
+            }
+            if !editing {
+                if let action {
+                    Button(action: action.run) {
+                        Image(systemName: action.symbol).font(.title2)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(action.label)
+                }
+                Button(action: toggle) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.bold))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .frame(width: 28, height: 28)
+                        .background(Circle().fill(Color(.tertiarySystemFill)))
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(expanded ? "Hide files" : "Show files")
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var tint: Color {
+        if allDone { return .green }
+        if downloading { return .accentColor }
+        if failed > 0 && waiting == 0 { return .red }
+        return .gray
+    }
+
+    private var summary: String {
+        let count = members.count
+        if allDone { return "\(count) files · \(Fmt.bytes(totalBytes)) · Finished" }
+        var parts = ["\(done) of \(count) files"]
+        if totalBytes > 0 { parts.append("\(Fmt.bytes(receivedBytes)) of \(Fmt.bytes(totalBytes))") }
+        if speed > 0 { parts.append(Fmt.speed(speed)) }
+        if failed > 0 {
+            parts.append("\(failed) failed")
+        } else if waiting == 0 && paused > 0 {
+            parts.append("Paused")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private struct GroupAction {
+        let symbol: String
+        let label: String
+        let run: () -> Void
+    }
+
+    /// Pause while anything is going, else resume what's paused, else retry what failed.
+    private var action: GroupAction? {
+        let ids = Set(members.map { $0.id })
+        let manager = self.manager
+        if waiting > 0 { return GroupAction(symbol: "pause.circle", label: "Pause") { manager.pauseAll(ids) } }
+        if paused > 0 { return GroupAction(symbol: "play.circle", label: "Resume") { manager.resumeAll(ids) } }
+        if failed > 0 { return GroupAction(symbol: "arrow.clockwise.circle", label: "Retry") { manager.retryFailed(ids) } }
+        return nil
+    }
+}
+
+/// The sheet for picking which of a waiting torrent's files to download.
+private struct ChooseFilesSheet: View {
+    @EnvironmentObject var manager: DownloadManager
+    @Environment(\.dismiss) private var dismiss
+    let itemID: UUID
+    @State private var files: [TorBoxFile]
+    @State private var title: String
+
+    init(itemID: UUID, item: DownloadItem?) {
+        self.itemID = itemID
+        // Taken once, so the list stays put while the sheet closes.
+        _files = State(initialValue: item?.choices ?? [])
+        _title = State(initialValue: item?.groupName ?? item?.fileName ?? "Torrent")
+    }
+
+    var body: some View {
+        NavigationStack {
+            if files.isEmpty {
+                ContentUnavailableView("Nothing to pick", systemImage: "checklist",
+                                       description: Text("This torrent's files have already been picked."))
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                    }
+            } else {
+                TorrentFilesView(title: title, files: files, showsCancel: true) { chosen in
+                    manager.chooseFiles(itemID, fileIDs: chosen)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Row
 
 struct DownloadRow: View {
@@ -308,6 +656,8 @@ struct DownloadRow: View {
     @Environment(\.editMode) private var editMode
     let item: DownloadItem
     let speed: Double?
+    var inGroup = false                       // shown under its torrent's group row
+    var chooseFiles: (() -> Void)? = nil      // opens the file picker for a waiting torrent
     @State private var expanded = false
 
     private var editing: Bool { editMode?.wrappedValue.isEditing == true }
@@ -356,6 +706,7 @@ struct DownloadRow: View {
             }
         }
         .padding(.vertical, 4)
+        .padding(.leading, inGroup ? 22 : 0)
     }
 
     private struct BarStyle {
@@ -369,6 +720,8 @@ struct DownloadRow: View {
             return BarStyle(fraction: item.bytesTotal > 0 ? item.progress : nil, tint: .accentColor)
         case .resolving:
             return item.torboxId != nil ? BarStyle(fraction: item.cloudProgress, tint: .purple) : nil
+        case .choosing:
+            return nil
         case .paused:
             return BarStyle(fraction: item.progress, tint: .gray)
         case .queued:
@@ -389,6 +742,9 @@ struct DownloadRow: View {
             return item.torboxId != nil ? "Queued · via TorBox" : "Queued"
         case .resolving:
             return item.status ?? "Resolving…"
+        case .choosing:
+            let count = item.choices?.count ?? 0
+            return "\(count) files ready on TorBox · Choose which to download"
         case .downloading:
             if let status = item.status { return status }   // "Connecting…", "Waiting for TorBox…"
             var parts: [String] = []
@@ -405,7 +761,8 @@ struct DownloadRow: View {
         case .completed:
             return item.bytesTotal > 0 ? "\(Fmt.bytes(item.bytesTotal)) · Finished" : "Finished"
         case .failed:
-            return item.error ?? "Failed"
+            let message = item.error ?? "Failed"
+            return item.retryAt != nil ? message + " Trying again by itself…" : message
         }
     }
 
@@ -414,6 +771,7 @@ struct DownloadRow: View {
         case .downloading, .resolving: return "pause.circle"
         case .paused: return "play.circle"
         case .failed: return "arrow.clockwise.circle"
+        case .choosing: return chooseFiles != nil ? "checklist" : nil
         default: return nil
         }
     }
@@ -422,6 +780,7 @@ struct DownloadRow: View {
         switch item.state {
         case .paused: return "Resume"
         case .failed: return "Retry"
+        case .choosing: return "Choose Files"
         default: return "Pause"
         }
     }
@@ -430,6 +789,7 @@ struct DownloadRow: View {
         switch item.state {
         case .downloading, .resolving: manager.pause(item.id)
         case .paused, .failed: manager.resume(item.id)
+        case .choosing: chooseFiles?()
         default: break
         }
     }
@@ -468,14 +828,11 @@ struct DownloadDetails: View {
                         pill("Copy Link", "doc.on.doc")
                     }
                 }
-                if item.state == .completed && item.savedFolder == nil {
+                if item.state == .completed {
                     Button {
-                        // Opens the Files app at this app's Downloads folder.
-                        let path = DownloadManager.downloadsDir.path
-                        let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
-                        if let url = URL(string: "shareddocuments://" + encoded) {
-                            UIApplication.shared.open(url)
-                        }
+                        // Opens the Files app at the folder the file is in.
+                        let file = DownloadManager.downloadsDir.appendingPathComponent(item.savedFileName ?? item.fileName)
+                        FilesApp.open(file.deletingLastPathComponent())
                     } label: {
                         pill("Show in Files", "folder")
                     }
@@ -517,19 +874,30 @@ struct DownloadDetails: View {
         if item.state == .resolving, let p = item.cloudProgress {
             r.append(DetailRow("TorBox", "\(Int(p * 100))% fetched"))
         }
+        if item.state == .choosing, let files = item.choices {
+            r.append(DetailRow("Files", "\(files.count) to choose from"))
+        }
+        if let torrent = item.groupName, item.state != .choosing {
+            r.append(DetailRow("Torrent", torrent))
+        }
         let source = item.sourceURL ?? item.url
-        if item.torboxKind == .torrent {
+        if source.host == "torbox.app" {
+            r.append(DetailRow("From", "Your TorBox cloud"))
+        } else if item.torboxKind == .torrent {
             let kind = source.isFileURL ? ".torrent file" : (source.scheme == "magnet" ? "Magnet link" : (source.host ?? "Torrent"))
             r.append(DetailRow("From", kind + " via TorBox"))
         } else {
             r.append(DetailRow("From", (source.host ?? source.absoluteString) + (item.torboxId != nil ? " via TorBox" : "")))
         }
         if item.state == .completed, let name = item.savedFileName {
-            r.append(DetailRow("Saved as", (item.savedFolder ?? "Downloads") + "/" + name))
+            r.append(DetailRow("Saved as", "Downloads/" + name))
         }
         if let d = item.addedAt { r.append(DetailRow("Added", Fmt.date(d))) }
         if let d = item.completedAt { r.append(DetailRow("Finished", Fmt.date(d))) }
         if item.state == .failed, let e = item.error { r.append(DetailRow("Error", e)) }
+        if item.state == .failed, item.retryAt != nil {
+            r.append(DetailRow("Next", "Tries again by itself in a moment"))
+        }
         return r
     }
 
@@ -537,6 +905,7 @@ struct DownloadDetails: View {
         switch item.state {
         case .queued: return "Queued"
         case .resolving: return item.torboxId != nil ? "TorBox is fetching it" : "Finding the file"
+        case .choosing: return "Ready: pick which files to download"
         case .downloading: return "Downloading"
         case .paused: return "Paused"
         case .completed: return "Finished"
@@ -602,7 +971,7 @@ struct FileBadge: View {
                 .fill(tint.opacity(0.14))
                 .frame(width: 42, height: 42)
                 .overlay(
-                    Image(systemName: FileBadge.symbol(for: item.fileName))
+                    Image(systemName: item.state == .choosing ? "checklist" : FileBadge.symbol(for: item.fileName))
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(tint)
                 )
@@ -623,6 +992,7 @@ struct FileBadge: View {
         case .completed: return .green
         case .failed: return .red
         case .resolving: return item.torboxId != nil ? .purple : .accentColor
+        case .choosing: return .purple
         case .paused, .queued: return .gray
         case .downloading: return .accentColor
         }
@@ -667,10 +1037,22 @@ struct AddLinksView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
     @State private var torrentPick: FilesPickRequest?
+    @State private var askingAboutRepeats = false
 
     private static let torrentType = UTType(filenameExtension: "torrent") ?? .data
 
     private var links: [URL] { DownloadManager.extractLinks(from: text) }
+
+    /// The links that are already in the list.
+    private var repeats: [URL] { manager.duplicates(in: links) }
+
+    private var repeatNote: String {
+        let count = repeats.count
+        if count == links.count {
+            return count == 1 ? "This link is already in your list." : "All of these links are already in your list."
+        }
+        return count == 1 ? "1 of these links is already in your list." : "\(count) of these links are already in your list."
+    }
 
     private var found: String {
         let magnets = links.filter { $0.scheme?.lowercased() == "magnet" }.count
@@ -688,6 +1070,11 @@ struct AddLinksView: View {
                     .padding(8)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
                 Text(found).font(.footnote).foregroundStyle(.secondary)
+                if !repeats.isEmpty {
+                    Label(repeatNote, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
                 Button {
                     torrentPick = FilesPickRequest(types: [Self.torrentType], asCopy: true, multiple: true)
                 } label: {
@@ -708,6 +1095,19 @@ struct AddLinksView: View {
                     dismiss()
                 }
             }
+            .confirmationDialog(repeatNote, isPresented: $askingAboutRepeats, titleVisibility: .visible) {
+                Button(repeats.count == 1 ? "Add It Again" : "Add Them Again") {
+                    manager.add(urls: links, allowDuplicates: true)
+                    dismiss()
+                }
+                if repeats.count < links.count {
+                    Button("Only Add the New Ones") {
+                        manager.add(urls: links)
+                        dismiss()
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            }
             .navigationTitle("Add links")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -716,9 +1116,19 @@ struct AddLinksView: View {
                     Button("Paste") { text = UIPasteboard.general.string ?? text }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Add") { manager.add(urls: links); dismiss() }.disabled(links.isEmpty)
+                    Button("Add") { addLinks() }.disabled(links.isEmpty)
                 }
             }
+        }
+    }
+
+    /// Adds the links, first asking about any that are already in the list.
+    private func addLinks() {
+        if repeats.isEmpty {
+            manager.add(urls: links)
+            dismiss()
+        } else {
+            askingAboutRepeats = true
         }
     }
 }

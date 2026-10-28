@@ -2,10 +2,12 @@ import Foundation
 import Security
 import Combine
 
-struct TorBoxFile {
+/// One file in a TorBox download or torrent.
+struct TorBoxFile: Codable, Hashable, Sendable {
     var id: Int
-    var name: String
+    var name: String          // the file's own name
     var size: Int64?
+    var path: String?         // where it is in the torrent, e.g. "Show S01/Subs/English.srt"
 }
 
 /// What TorBox fetches: a link from a file host, or a torrent (magnet link or .torrent file).
@@ -32,6 +34,7 @@ struct TorBoxWebDownload {
     var progress: Double?
     var state: String
     var files: [TorBoxFile]
+    var name = ""             // the torrent's (or download's) name on TorBox
 
     /// How far TorBox has fetched the file, 0...1 (nil until it reports progress).
     var fraction: Double? {
@@ -51,6 +54,23 @@ struct TorBoxWebDownload {
         if lower.contains("queued") { return "TorBox: queued…" }
         return "TorBox: \(state)"
     }
+}
+
+/// A download or torrent in your TorBox account (the TorBox Cloud screen).
+struct TorBoxCloudItem: Identifiable, Hashable, Sendable {
+    var kind: TorBoxKind
+    var torboxID: Int
+    var name: String
+    var size: Int64?
+    var addedAt: Date?
+    var infoHash: String?         // torrents: their info hash
+    var ready: Bool               // TorBox has every file
+    var failure: String?
+    var statusText: String
+    var fraction: Double?
+    var files: [TorBoxFile]
+
+    var id: String { kind.rawValue + "-" + String(torboxID) }
 }
 
 enum TorBoxError: LocalizedError {
@@ -288,9 +308,10 @@ final class TorBox: ObservableObject {
             guard let fileId = Self.int(f["id"]) else { return nil }
             let short = (f["short_name"] as? String) ?? ""
             let full = (f["name"] as? String) ?? ""
-            let name = short.isEmpty ? (full as NSString).lastPathComponent : short
-            return TorBoxFile(id: fileId, name: name.isEmpty ? "file-\(fileId)" : name,
-                              size: Self.int64(f["size"]))
+            var name = short.isEmpty ? (full as NSString).lastPathComponent : short
+            if name.isEmpty { name = "file-\(fileId)" }
+            return TorBoxFile(id: fileId, name: name, size: Self.int64(f["size"]),
+                              path: full.isEmpty ? name : full)
         }
 
         var failure: String?
@@ -303,7 +324,39 @@ final class TorBox: ObservableObject {
                                  failure: failure,
                                  progress: Self.double(o["progress"]),
                                  state: state,
-                                 files: files)
+                                 files: files,
+                                 name: (o["name"] as? String) ?? "")
+    }
+
+    // MARK: Your TorBox account
+
+    /// Everything of one kind in your TorBox account, newest first.
+    func cloud(_ kind: TorBoxKind) async throws -> [TorBoxCloudItem] {
+        let data = try await call("GET", kind.path + "/mylist", query: [URLQueryItem(name: "bypass_cache", value: "true")])
+        let list = ((data as? [[String: Any]]) ?? []).compactMap { Self.cloudItem($0, kind: kind) }
+        return list.sorted { ($0.addedAt ?? .distantPast) > ($1.addedAt ?? .distantPast) }
+    }
+
+    private static func cloudItem(_ o: [String: Any], kind: TorBoxKind) -> TorBoxCloudItem? {
+        guard let id = int(o["id"]), let dl = try? parseWebDownload(o, id: id) else { return nil }
+        let added = (o["created_at"] as? String).flatMap { Self.parseDate($0) }
+        let hash = (o["hash"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return TorBoxCloudItem(kind: kind, torboxID: id,
+                               name: dl.name.isEmpty ? "TorBox download \(id)" : dl.name,
+                               size: int64(o["size"]), addedAt: added, infoHash: hash,
+                               ready: dl.ready, failure: dl.failure, statusText: dl.statusText,
+                               fraction: dl.fraction, files: dl.files)
+    }
+
+    /// Deletes a download or torrent from your TorBox account.
+    func remove(_ kind: TorBoxKind, id: Int) async throws {
+        if kind == .torrent {
+            _ = try await call("POST", "torrents/controltorrent",
+                               jsonBody: ["torrent_id": id, "operation": "delete", "all": false])
+        } else {
+            _ = try await call("POST", "webdl/controlwebdownload",
+                               jsonBody: ["webdl_id": id, "operation": "delete", "all": false])
+        }
     }
 
     /// A permanent TorBox link that redirects to a fresh download URL each time,
@@ -327,6 +380,7 @@ final class TorBox: ObservableObject {
                       query: [URLQueryItem] = [],
                       form: [String: String]? = nil,
                       files: [FormFile] = [],
+                      jsonBody: [String: Any]? = nil,
                       key overrideKey: String? = nil,
                       auth: Bool = true) async throws -> Any? {
         var comps = URLComponents(string: Self.base + path)
@@ -356,6 +410,9 @@ final class TorBox: ObservableObject {
             }
             body.append(Data("--\(boundary)--\r\n".utf8))
             req.httpBody = body
+        } else if let jsonBody {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: jsonBody)
         }
 
         let (data, response) = try await URLSession.shared.data(for: req)

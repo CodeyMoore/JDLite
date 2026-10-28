@@ -1,9 +1,8 @@
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
-import MachO
 
-// MARK: - Showing the Files picker
+// The Files picker, used to add .torrent files.
 
 /// A request to show the Files picker. Every request is new, so tapping again always opens it again.
 struct FilesPickRequest: Identifiable, Equatable {
@@ -11,8 +10,6 @@ struct FilesPickRequest: Identifiable, Equatable {
     var types: [UTType]
     var asCopy = false
     var multiple = false
-    /// Record what the picker does in `PickerLog` (shown in Settings).
-    var logs = false
 }
 
 extension View {
@@ -52,9 +49,8 @@ struct FilesPickerModifier: ViewModifier {
     }
 
     private func present(_ req: FilesPickRequest) {
-        DirectDocumentPicker.present(req, from: anchor.view, onFailure: { reason in
+        DirectDocumentPicker.present(req, from: anchor.view, onFailure: {
             guard request?.id == req.id else { return }
-            if req.logs { PickerLog.shared.add(reason + ", so showing it in a sheet instead") }
             sheetRequest = req
         }, onFinish: { urls in
             finish(urls, for: req)
@@ -77,10 +73,7 @@ struct FilesPickerModifier: ViewModifier {
 
 /// The system Files picker, reporting when it appears and when it closes.
 final class TrackedDocumentPicker: UIDocumentPickerViewController {
-    enum Event {
-        case appeared(visible: Bool)
-        case disappeared
-    }
+    enum Event { case appeared, disappeared }
 
     var onEvent: ((Event) -> Void)?
 
@@ -93,10 +86,7 @@ final class TrackedDocumentPicker: UIDocumentPickerViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        let window = view.window
-        let visible = window != nil && window?.isHidden == false
-            && window?.windowScene?.activationState == .foregroundActive
-        onEvent?(.appeared(visible: visible))
+        onEvent?(.appeared)
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -105,7 +95,7 @@ final class TrackedDocumentPicker: UIDocumentPickerViewController {
     }
 }
 
-/// Gets the picker's answer (once) and records what the picker does.
+/// Gets the picker's answer, once.
 @MainActor
 final class PickerHandler: NSObject, UIDocumentPickerDelegate {
     var onFinish: (([URL]) -> Void)?
@@ -114,21 +104,12 @@ final class PickerHandler: NSObject, UIDocumentPickerDelegate {
     private(set) var appeared = false
     private(set) var finished = false
     private var appearedAt: Date?
-    private let logs: Bool
-
-    init(logs: Bool) {
-        self.logs = logs
-    }
 
     func attach(to picker: TrackedDocumentPicker) {
         picker.delegate = self
         picker.onEvent = { [weak self] event in
             self?.handle(event)
         }
-    }
-
-    func log(_ text: String) {
-        if logs { PickerLog.shared.add(text) }
     }
 
     /// Stops listening: the caller has given up on this picker.
@@ -140,12 +121,10 @@ final class PickerHandler: NSObject, UIDocumentPickerDelegate {
 
     private func handle(_ event: TrackedDocumentPicker.Event) {
         switch event {
-        case .appeared(let visible):
+        case .appeared:
             appeared = true
             appearedAt = Date()
-            log(visible ? "Picker is on screen" : "Picker appeared, but not in a window you can see")
         case .disappeared:
-            log("Picker closed")
             guard !finished else { return }
             let quick = appearedAt.map { Date().timeIntervalSince($0) < 1 } ?? true
             Task { @MainActor in
@@ -159,19 +138,16 @@ final class PickerHandler: NSObject, UIDocumentPickerDelegate {
                 }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard !self.finished else { return }
-                self.log("It closed without an answer")
                 self.finish([])
             }
         }
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        log(urls.isEmpty ? "Answer: nothing picked" : "Answer: " + urls.map { $0.path }.joined(separator: ", "))
         finish(urls)
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        log("Answer: cancelled")
         finish([])
     }
 
@@ -190,14 +166,13 @@ struct DocumentPicker: UIViewControllerRepresentable {
     var onFinish: ([URL]) -> Void
 
     func makeCoordinator() -> PickerHandler {
-        PickerHandler(logs: request.logs)
+        PickerHandler()
     }
 
     func makeUIViewController(context: Context) -> TrackedDocumentPicker {
         let picker = TrackedDocumentPicker.make(for: request)
         context.coordinator.onFinish = onFinish
         context.coordinator.attach(to: picker)
-        context.coordinator.log("Showing the picker in a sheet")
         return picker
     }
 
@@ -217,22 +192,18 @@ enum DirectDocumentPicker {
     ///   - onFailure: called if the picker didn't appear, or closed the moment it appeared.
     ///   - onFinish: called once, with the items picked (nothing if cancelled).
     static func present(_ request: FilesPickRequest, from anchor: UIView?,
-                        onFailure: @escaping (String) -> Void,
+                        onFailure: @escaping () -> Void,
                         onFinish: @escaping ([URL]) -> Void) {
-        var screens: [String] = []
         var top = (anchor?.window ?? keyWindow())?.rootViewController
-        while let vc = top {
-            screens.append(String(describing: type(of: vc)))
-            guard let next = vc.presentedViewController, !next.isBeingDismissed else { break }
+        while let next = top?.presentedViewController, !next.isBeingDismissed {
             top = next
         }
         guard let presenter = top else {
-            if request.logs { PickerLog.shared.add("No window to show the picker in") }
-            onFailure("It had nowhere to appear")
+            onFailure()
             return
         }
 
-        let handler = PickerHandler(logs: request.logs)
+        let handler = PickerHandler()
         DirectDocumentPicker.current = handler
         handler.onFinish = { urls in
             if DirectDocumentPicker.current === handler { DirectDocumentPicker.current = nil }
@@ -240,11 +211,10 @@ enum DirectDocumentPicker {
         }
         handler.onClosedAtOnce = {
             if DirectDocumentPicker.current === handler { DirectDocumentPicker.current = nil }
-            onFailure("It closed the moment it appeared")
+            onFailure()
         }
         let picker = TrackedDocumentPicker.make(for: request)
         handler.attach(to: picker)
-        handler.log("Showing the picker over " + screens.joined(separator: " › "))
         presenter.present(picker, animated: true)
 
         Task { @MainActor in
@@ -252,7 +222,7 @@ enum DirectDocumentPicker {
             guard !handler.appeared, !handler.finished else { return }
             handler.giveUp()
             if DirectDocumentPicker.current === handler { DirectDocumentPicker.current = nil }
-            onFailure("It didn't appear")
+            onFailure()
         }
     }
 
@@ -286,81 +256,4 @@ struct AnchorView: UIViewRepresentable {
     func updateUIView(_ view: UIView, context: Context) {
         anchor.view = view
     }
-}
-
-// MARK: - Diagnostics
-
-/// What the folder picker did last time, shown in Settings so a failed attempt can be tracked down.
-@MainActor
-final class PickerLog: ObservableObject {
-    static let shared = PickerLog()
-
-    @Published private(set) var lines: [String] = []
-
-    private let clock: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss.S"
-        return formatter
-    }()
-
-    func add(_ event: String) {
-        lines.append(clock.string(from: Date()) + "  " + event)
-        if lines.count > 16 { lines.removeFirst(lines.count - 16) }
-    }
-
-    func clear() {
-        lines = []
-    }
-}
-
-/// How this copy of JDLite is installed and signed. Shown in Settings, because some install
-/// problems (like the Files picker not handing over folders) come from how an app was signed.
-enum AppIdentity {
-    /// The bundle ID the app reports, plus the one in its Info.plist file if they differ.
-    static let bundleID: String = {
-        let reported = Bundle.main.bundleIdentifier ?? "?"
-        guard let url = Bundle.main.url(forResource: "Info", withExtension: "plist"),
-              let data = try? Data(contentsOf: url),
-              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              let inFile = plist["CFBundleIdentifier"] as? String else {
-            return reported
-        }
-        return inFile == reported ? reported : "\(reported) (file says \(inFile))"
-    }()
-
-    /// The app ID and team in the provisioning profile the app was signed with.
-    static let signedAs: String = {
-        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
-              let data = try? Data(contentsOf: url) else {
-            return "No profile"
-        }
-        guard let start = data.range(of: Data("<?xml".utf8)),
-              let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
-              let plist = try? PropertyListSerialization.propertyList(
-                from: data.subdata(in: start.lowerBound..<end.upperBound), format: nil) as? [String: Any] else {
-            return "Unreadable profile"
-        }
-        let entitlements = plist["Entitlements"] as? [String: Any]
-        let appID = entitlements?["application-identifier"] as? String ?? "?"
-        let team = plist["TeamName"] as? String ?? ""
-        return team.isEmpty ? appID : "\(appID) (\(team))"
-    }()
-
-    /// Code libraries loaded from inside the app other than JDLite itself, e.g. added by a signing service.
-    static let addedLibraries: String = {
-        func trimmed(_ path: String) -> String {
-            path.hasPrefix("/private/") ? String(path.dropFirst("/private".count)) : path
-        }
-        let appPath = trimmed(Bundle.main.bundlePath) + "/"
-        let executable = trimmed(Bundle.main.executablePath ?? "")
-        var names: [String] = []
-        for index in 0..<_dyld_image_count() {
-            guard let cName = _dyld_get_image_name(index) else { continue }
-            let path = trimmed(String(cString: cName))
-            if path.hasPrefix(appPath) && path != executable {
-                names.append((path as NSString).lastPathComponent)
-            }
-        }
-        return names.isEmpty ? "None" : names.joined(separator: ", ")
-    }()
 }

@@ -2,7 +2,8 @@ import Foundation
 import Combine
 import UIKit
 
-enum DownloadState: String, Codable { case queued, resolving, downloading, paused, completed, failed }
+/// `choosing`: a torrent is ready on TorBox and waits for you to pick which files to download.
+enum DownloadState: String, Codable { case queued, resolving, choosing, downloading, paused, completed, failed }
 
 /// One byte range of a file. In-app connections write it straight into the download's data
 /// file; a background (iOS) transfer fetches it into a file of its own, which is copied into
@@ -23,6 +24,13 @@ struct Segment: Codable, Equatable {
 struct Probe: Sendable {
     let total: Int64
     let acceptsRanges: Bool
+}
+
+/// A finished file in its place in Downloads. (Not called SavedFile: an older file used that name.)
+struct FinishedFile: Sendable {
+    let url: URL
+    let path: String                 // inside Downloads, with its folder
+    let size: Int64
 }
 
 /// What a background transfer's description says about it.
@@ -59,12 +67,17 @@ struct DownloadItem: Identifiable, Codable {
     var layout: Int?                 // 2: parts are saved into one data file
     var torboxKind: TorBoxKind?      // .torrent for torrents (nil: a link from a file host)
     var torrentFile: String?         // a .torrent file waiting to go to TorBox (in Torrents/)
-    var savedBookmark: Data?         // the finished file, when it's in a folder you picked
-    var savedFolder: String?         // that folder's name (nil: JDLite's Downloads folder)
+    var groupID: UUID?               // a torrent's files share this; the list shows them as one group
+    var groupName: String?           // that torrent's name
+    var folder: String?              // the folder inside Downloads the file goes into (nil: Downloads itself)
+    var choices: [TorBoxFile]?       // a torrent's files, while you pick which to download
+    var autoRetries: Int?            // tries it made by itself after the connection dropped
+    var retryAt: Date?               // when it tries again by itself
+    var retryMark: Int64?            // how far it had got at the last of those tries
 
     var progress: Double { bytesTotal > 0 ? min(Double(bytesReceived) / Double(bytesTotal), 1) : 0 }
 
-    /// The finished file in Downloads, if there is one.
+    /// The finished file's path inside Downloads (with its folder), if there is one.
     var savedFileName: String? { savedName ?? (state == .completed ? fileName : nil) }
 }
 
@@ -77,6 +90,9 @@ final class DownloadManager: NSObject, ObservableObject {
     @Published private(set) var speeds: [UUID: Double] = [:]
     /// How many connections each running download is using.
     @Published private(set) var connectionCounts: [UUID: Int] = [:]
+    /// Links sent from Safari or the share sheet that were already in the list. The list asks
+    /// whether to add them again.
+    @Published private(set) var repeatedLinks: [URL] = []
     /// Handed over by iOS when it wakes the app for finished background transfers.
     var backgroundCompletionHandlers: [String: () -> Void] = [:]
 
@@ -116,6 +132,9 @@ final class DownloadManager: NSObject, ObservableObject {
     private var pendingRestarts = Set<UUID>()
     private var restartTask: Task<Void, Never>?
     private var keepAwakeCheck: Task<Void, Never>?
+    private var retryTimer: Task<Void, Never>?
+    /// How long a download waits before each try it makes by itself.
+    private static let retryDelays: [TimeInterval] = [10, 30, 60, 120, 300]
     private var observers: [NSObjectProtocol] = []
     private var lastSave: TimeInterval = 0
     private let storeURL: URL = {
@@ -152,9 +171,12 @@ final class DownloadManager: NSObject, ObservableObject {
 
     // MARK: Public API
 
-    func add(urls: [URL]) {
+    /// Adds links. Links already in the list are skipped unless `allowDuplicates` is set.
+    func add(urls: [URL], allowDuplicates: Bool = false) {
+        var known = allowDuplicates ? Set<String>() : linkKeys
         var ids: [UUID] = []
-        for url in urls where !items.contains(where: { ($0.sourceURL ?? $0.url) == url && $0.state != .completed }) {
+        for url in urls {
+            guard known.insert(Self.linkKey(url)).inserted else { continue }   // already there, or twice in one go
             var name = url.lastPathComponent
             if name.isEmpty || name == "/" { name = url.host ?? "download" }
             let magnet = url.scheme?.lowercased() == "magnet"
@@ -173,6 +195,34 @@ final class DownloadManager: NSObject, ObservableObject {
         for id in ids { Task { await runResolve(id) } }
     }
 
+    /// Keys of the links in the list (see `linkKey`).
+    private var linkKeys: Set<String> {
+        Set(items.compactMap { item -> String? in
+            let link = item.sourceURL ?? item.url
+            return link.isFileURL ? nil : Self.linkKey(link)
+        })
+    }
+
+    /// The links in `urls` that are already in the list.
+    func duplicates(in urls: [URL]) -> [URL] {
+        let known = linkKeys
+        return urls.filter { known.contains(Self.linkKey($0)) }
+    }
+
+    /// Spots the same link twice: magnet links by their torrent's hash, other links as they are.
+    nonisolated static func linkKey(_ url: URL) -> String {
+        if url.scheme?.lowercased() == "magnet",
+           let xt = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+               .first(where: { $0.name.lowercased() == "xt" })?.value, !xt.isEmpty {
+            return "magnet:" + xt.lowercased()
+        }
+        return url.absoluteString
+    }
+
+    func clearRepeatedLinks() {
+        repeatedLinks = []
+    }
+
     /// Handles jdlite://add?u=<url>&u=<url> links from the Safari and share extensions
     /// (t=<base64 .torrent file>&tn=<its name> for torrent files), and files opened in JDLite.
     func handleOpen(_ url: URL) {
@@ -188,7 +238,9 @@ final class DownloadManager: NSObject, ObservableObject {
             .compactMap { $0.value }
             .compactMap { URL(string: $0) }
             .filter { ["http", "https", "magnet"].contains($0.scheme?.lowercased() ?? "") }
-        add(urls: urls)
+        let repeats = duplicates(in: urls)
+        add(urls: urls)   // the new ones; the list asks about the others
+        if !repeats.isEmpty { repeatedLinks = repeats }
         let names = query.filter { $0.name == "tn" }.compactMap { $0.value }
         for (k, encoded) in query.filter({ $0.name == "t" }).compactMap({ $0.value }).enumerated() {
             if let data = Self.base64URLDecode(encoded) {
@@ -228,10 +280,18 @@ final class DownloadManager: NSObject, ObservableObject {
         Task { await runResolve(id) }
     }
 
-    func resume(_ id: UUID) {
+    /// Carries on with a paused or failed download. `automatic`: a try it makes by itself.
+    func resume(_ id: UUID, automatic: Bool = false) {
         guard let item = items.first(where: { $0.id == id }) else { return }
         clearAttempts(id)
         workerLimit[id] = nil
+        mutate(id, persist: false) {
+            $0.retryAt = nil
+            if !automatic {
+                $0.autoRetries = nil
+                $0.retryMark = nil
+            }
+        }
         if item.needsResolve == true {
             mutate(id) { $0.state = .resolving; $0.error = nil }
             Task { await runResolve(id) }
@@ -266,6 +326,50 @@ final class DownloadManager: NSObject, ObservableObject {
         }
     }
 
+    /// Pauses every unfinished download (or just the ones in `only`).
+    func pauseAll(_ only: Set<UUID>? = nil) {
+        // Waiting ones first, so pausing a running one doesn't start them.
+        for i in items.indices where only?.contains(items[i].id) ?? true {
+            switch items[i].state {
+            case .queued, .resolving:
+                items[i].state = .paused
+                items[i].status = nil
+            case .failed where items[i].retryAt != nil:
+                items[i].state = .paused   // it was going to try again by itself
+                items[i].retryAt = nil
+            default:
+                break
+            }
+        }
+        let running = items.filter { $0.state == .downloading && (only?.contains($0.id) ?? true) }.map { $0.id }
+        for id in running { pause(id) }
+        save()
+        scheduleRetryCheck()
+    }
+
+    /// Carries on with every paused download (or just the ones in `only`).
+    func resumeAll(_ only: Set<UUID>? = nil) {
+        let ids = items.filter { $0.state == .paused && (only?.contains($0.id) ?? true) }.map { $0.id }
+        for id in ids { resume(id) }
+    }
+
+    /// Tries every failed download again (or just the ones in `only`).
+    func retryFailed(_ only: Set<UUID>? = nil) {
+        let ids = items.filter { $0.state == .failed && (only?.contains($0.id) ?? true) }.map { $0.id }
+        for id in ids { resume(id) }
+    }
+
+    var canPauseAll: Bool {
+        items.contains {
+            $0.state == .queued || $0.state == .resolving || $0.state == .downloading
+                || ($0.state == .failed && $0.retryAt != nil)
+        }
+    }
+
+    var canResumeAll: Bool { items.contains { $0.state == .paused } }
+
+    var hasFailed: Bool { items.contains { $0.state == .failed } }
+
     /// Removes downloads from the list and deletes their files: the finished file,
     /// or whatever was downloaded so far.
     func delete(_ ids: Set<UUID>) {
@@ -284,21 +388,22 @@ final class DownloadManager: NSObject, ObservableObject {
             for (task, _) in await liveTasks(for: ids) { task.cancel() }
         }
         let remaining = items.filter { !ids.contains($0.id) }
-        let stillUsed = Set(remaining.filter { $0.savedBookmark == nil }.compactMap { $0.savedFileName })
+        let stillUsed = Set(remaining.compactMap { $0.savedFileName })
         for item in items where ids.contains(item.id) {
             try? FileManager.default.removeItem(at: Self.partsDir(item.id))
             if let stored = item.torrentFile {
                 try? FileManager.default.removeItem(at: Self.torrentsDir.appendingPathComponent(stored))
             }
-            if let bookmark = item.savedBookmark {
-                Self.removeSaved(name: item.savedName ?? "", bookmark: bookmark)
-            } else if let name = item.savedFileName, !stillUsed.contains(name) {
-                try? FileManager.default.removeItem(at: Self.downloadsDir.appendingPathComponent(name))
+            if let name = item.savedFileName, !stillUsed.contains(name) {
+                let file = Self.downloadsDir.appendingPathComponent(name)
+                try? FileManager.default.removeItem(at: file)
+                Self.removeEmptyFolders(above: file)
             }
         }
         items = remaining
         save()
         startNext()
+        scheduleRetryCheck()
     }
 
     /// Removes finished downloads from the list. Their files stay in Downloads.
@@ -521,7 +626,7 @@ final class DownloadManager: NSObject, ObservableObject {
                             mutate(item.id) { $0.torboxId = nil; $0.cloudProgress = nil }   // retry adds it again
                             failResolve(item.id, "TorBox: " + failure)
                         } else if dl.ready {
-                            torboxReady(item.id, webId: webId, files: dl.files)
+                            torboxReady(item.id, webId: webId, download: dl)
                         } else {
                             mutate(item.id, persist: false) {
                                 $0.status = dl.statusText
@@ -536,7 +641,7 @@ final class DownloadManager: NSObject, ObservableObject {
                     let n = (strikes[item.id] ?? 0) + 1
                     strikes[item.id] = n
                     if n >= 6 {
-                        failResolve(item.id, "TorBox: can't connect. Tap retry.")
+                        failResolve(item.id, "TorBox: can't connect.", retryable: true)
                     } else {
                         setStatus(item.id, "TorBox: connection problem, retrying…")
                     }
@@ -556,20 +661,65 @@ final class DownloadManager: NSObject, ObservableObject {
         }
     }
 
-    private func torboxReady(_ id: UUID, webId: Int, files: [TorBoxFile]) {
+    /// TorBox has every file. A torrent with several files waits for you to pick which ones
+    /// (unless that's switched off in Settings); otherwise they all start downloading.
+    private func torboxReady(_ id: UUID, webId: Int, download dl: TorBoxWebDownload) {
+        guard !dl.files.isEmpty, let item = items.first(where: { $0.id == id }) else { return }
+        let name = Self.cleanName(dl.name.isEmpty ? item.fileName : dl.name)
+        if (item.torboxKind ?? .web) == .torrent, dl.files.count > 1, AppSettings.shared.askTorrentFiles {
+            mutate(id) {
+                $0.state = .choosing
+                $0.choices = dl.files
+                $0.fileName = name
+                $0.groupName = name
+                $0.bytesTotal = dl.files.reduce(Int64(0)) { $0 + max($1.size ?? 0, 0) }
+                $0.status = nil
+                $0.error = nil
+                $0.cloudProgress = nil
+            }
+            if let waiting = items.first(where: { $0.id == id }) { Notifier.shared.chooseFiles(waiting) }
+            return
+        }
+        startFiles(id, webId: webId, files: dl.files, torrentFileCount: dl.files.count, torrentName: name)
+    }
+
+    /// Downloads the files you picked from a torrent that was waiting for you.
+    func chooseFiles(_ id: UUID, fileIDs: Set<Int>) {
+        guard let item = items.first(where: { $0.id == id }), item.state == .choosing,
+              let all = item.choices, let webId = item.torboxId else { return }
+        let picked = all.filter { fileIDs.contains($0.id) }
+        guard !picked.isEmpty else { return }
+        startFiles(id, webId: webId, files: picked, torrentFileCount: all.count,
+                   torrentName: item.groupName ?? item.fileName)
+    }
+
+    /// Turns a download TorBox has finished into one download per file. The first file keeps
+    /// the original entry. Files of a torrent with several files go into the torrent's own
+    /// folder, laid out as in the torrent, and show as one group in the list.
+    private func startFiles(_ id: UUID, webId: Int, files: [TorBoxFile], torrentFileCount: Int, torrentName: String) {
         guard let first = files.first, let item = items.first(where: { $0.id == id }) else { return }
         let origin = item.sourceURL ?? item.url
+        let several = torrentFileCount > 1
+        let group: UUID? = files.count > 1 ? UUID() : nil
+        let groupName: String? = several ? Self.cleanName(torrentName) : nil
+        func folder(of file: TorBoxFile) -> String? {
+            several ? Self.torrentFolder(torrent: torrentName, file: file.path ?? file.name) : nil
+        }
         mutate(id, persist: false) {
             $0.torboxFileId = first.id
             $0.fileName = Self.cleanName(first.name)
             $0.preferredName = Self.cleanName(first.name)
             $0.sourceURL = origin
-            if let size = first.size, size > 0 { $0.bytesTotal = size }
+            $0.bytesTotal = max(first.size ?? 0, 0)
             $0.cloudProgress = nil
             $0.state = .queued
             $0.needsResolve = nil
             $0.status = nil
             $0.error = nil
+            $0.choices = nil
+            $0.groupID = group
+            $0.groupName = groupName
+            $0.folder = folder(of: first)
         }
         for file in files.dropFirst() {
             var extra = DownloadItem(url: origin, fileName: Self.cleanName(file.name))
@@ -579,11 +729,70 @@ final class DownloadManager: NSObject, ObservableObject {
             extra.torboxKind = item.torboxKind
             extra.torboxFileId = file.id
             extra.bytesTotal = max(file.size ?? 0, 0)
-            extra.addedAt = Date()
+            extra.addedAt = item.addedAt ?? Date()   // same as the torrent, so its files stay together
+            extra.groupID = group
+            extra.groupName = groupName
+            extra.folder = folder(of: file)
             items.append(extra)
         }
         save()
         startNext()
+    }
+
+    /// Downloads files that are already in your TorBox account (the TorBox Cloud screen).
+    /// Files already in the list and not finished are skipped. Returns how many were added.
+    @discardableResult
+    func addFromTorBox(_ entry: TorBoxCloudItem, files: [TorBoxFile]) -> Int {
+        let origin = Self.cloudLink(entry)
+        let several = entry.files.count > 1
+        let fresh = files.filter { file in
+            !items.contains {
+                $0.torboxId == entry.torboxID && ($0.torboxKind ?? .web) == entry.kind
+                    && $0.torboxFileId == file.id && $0.state != .completed
+            }
+        }
+        let group: UUID? = fresh.count > 1 ? UUID() : nil
+        let now = Date()
+        for file in fresh {
+            var item = DownloadItem(url: origin, fileName: Self.cleanName(file.name))
+            item.preferredName = Self.cleanName(file.name)
+            item.sourceURL = origin
+            item.torboxId = entry.torboxID
+            item.torboxKind = entry.kind
+            item.torboxFileId = file.id
+            item.bytesTotal = max(file.size ?? 0, 0)
+            item.addedAt = now
+            item.groupID = group
+            item.groupName = several ? Self.cleanName(entry.name) : nil
+            item.folder = several ? Self.torrentFolder(torrent: entry.name, file: file.path ?? file.name) : nil
+            items.append(item)
+        }
+        if !fresh.isEmpty {
+            save()
+            Notifier.shared.askPermissionIfNeeded()
+            startNext()
+        }
+        return fresh.count
+    }
+
+    /// The link a TorBox Cloud download is listed with: a magnet link for a torrent, else TorBox itself.
+    nonisolated static func cloudLink(_ entry: TorBoxCloudItem) -> URL {
+        if entry.kind == .torrent, let hash = entry.infoHash, let magnet = URL(string: "magnet:?xt=urn:btih:" + hash) {
+            return magnet
+        }
+        return URL(string: "https://torbox.app/dashboard")!
+    }
+
+    /// With "Remove From TorBox When Done" on: once every file of a TorBox download is
+    /// downloaded, delete it from the TorBox account.
+    private func removeFromTorBoxIfDone(_ item: DownloadItem) {
+        guard AppSettings.shared.removeFromTorBox, let webId = item.torboxId else { return }
+        let kind = item.torboxKind ?? .web
+        let unfinished = items.contains {
+            $0.torboxId == webId && ($0.torboxKind ?? .web) == kind && $0.state != .completed
+        }
+        guard !unfinished else { return }
+        Task { try? await TorBox.shared.remove(kind, id: webId) }
     }
 
     private func isResolving(_ id: UUID) -> Bool {
@@ -594,10 +803,10 @@ final class DownloadManager: NSObject, ObservableObject {
         mutate(id, persist: false) { $0.status = text }
     }
 
-    private func failResolve(_ id: UUID, _ message: String) {
+    private func failResolve(_ id: UUID, _ message: String, retryable: Bool = false) {
         guard isResolving(id) else { return }   // paused or removed meanwhile
         mutate(id) { $0.state = .failed; $0.error = message; $0.status = nil }
-        notifyFailed(id)
+        if !(retryable && planAutoRetry(id)) { notifyFailed(id) }
     }
 
     // MARK: Queue
@@ -653,7 +862,63 @@ final class DownloadManager: NSObject, ObservableObject {
             }
             startNext()
             save()
+            runDueRetries()
         }
+    }
+
+    // MARK: Trying again by itself
+
+    /// After a download failed because the connection dropped (or the server was busy), it
+    /// tries again by itself: after 10 s, then 30 s, 1, 2 and 5 minutes. The count starts over
+    /// whenever it got further. Returns false if it won't try again.
+    @discardableResult
+    private func planAutoRetry(_ id: UUID) -> Bool {
+        guard AppSettings.shared.autoRetry, let i = index(of: id), items[i].state == .failed else { return false }
+        var tries = items[i].autoRetries ?? 0
+        if let mark = items[i].retryMark, items[i].bytesReceived > mark { tries = 0 }   // it got further
+        guard tries < Self.retryDelays.count else {
+            items[i].retryAt = nil
+            save()
+            return false
+        }
+        items[i].autoRetries = tries + 1
+        items[i].retryMark = items[i].bytesReceived
+        items[i].retryAt = Date().addingTimeInterval(Self.retryDelays[tries])
+        save()
+        scheduleRetryCheck()
+        return true
+    }
+
+    /// Starts the tries that are due, if there's a network downloads may use.
+    private func runDueRetries() {
+        if NetworkMonitor.shared.connected, networkWait == nil {
+            let now = Date()
+            let due = items.filter { item in
+                item.state == .failed && (item.retryAt.map { $0 <= now } ?? false)
+            }.map { $0.id }
+            for id in due { resume(id, automatic: true) }
+        }
+        scheduleRetryCheck()
+    }
+
+    /// Wakes up for the next try that's due. (Tries that are due while there's no network
+    /// start when it comes back: see `networkChanged`.)
+    private func scheduleRetryCheck() {
+        retryTimer?.cancel()
+        retryTimer = nil
+        let now = Date()
+        guard let next = items.compactMap({ $0.state == .failed ? $0.retryAt : nil }).filter({ $0 > now }).min() else { return }
+        let wait = next.timeIntervalSince(now) + 0.5
+        retryTimer = Task {
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self.retryTimer = nil
+            self.runDueRetries()
+        }
+    }
+
+    private var waitingToRetry: Bool {
+        items.contains { $0.state == .failed && $0.retryAt != nil }
     }
 
     /// Stops a download for now (not paused by you): it's queued again with a note why.
@@ -914,7 +1179,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 retry(worker, after: delay)
             } else {
                 retire(worker)
-                failDownload(id, message: "The server keeps dropping the connection. Tap retry to carry on.")
+                failDownload(id, message: "The server keeps dropping the connection.", retryable: true)
             }
         case .failed(let message, let retryable):
             recordProgress(at: i, part: part, position: position)
@@ -922,7 +1187,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 retry(worker, after: delay)
             } else {
                 retire(worker)
-                failDownload(id, message: message)
+                failDownload(id, message: message, retryable: retryable)
             }
         case .http(let status, let message):
             recordProgress(at: i, part: part, position: position)
@@ -960,7 +1225,7 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         retire(worker)
         let text = message.map { "HTTP \(status): \($0)" } ?? "HTTP \(status)"
-        failDownload(id, message: text, resolveAgain: true)
+        failDownload(id, message: text, resolveAgain: true, retryable: status == 429 || status >= 500)
     }
 
     /// Gives a connection that finished its job something else to do, or lets it go.
@@ -1099,16 +1364,16 @@ final class DownloadManager: NSObject, ObservableObject {
         deliver(id, file: data, name: Self.cleanName(items[i].preferredName ?? items[i].fileName))
     }
 
-    /// Moves a finished file to where files are saved: JDLite's Downloads folder, or the
-    /// folder you picked (copying to iCloud Drive or a USB drive can take a moment).
+    /// Moves a finished file into JDLite's Downloads folder (into its torrent's folder, for a
+    /// torrent's files), under a name that's free.
     private func deliver(_ id: UUID, file: URL, name: String) {
         guard !delivering.contains(id) else { return }
         delivering.insert(id)
         mutate(id, persist: false) { $0.status = "Saving…" }
         if UIApplication.shared.applicationState == .background { beginFinishUpTime() }
-        let target = SaveLocation.shared.target()
+        let folder = items.first(where: { $0.id == id })?.folder
         Task {
-            let result = await Self.saveFinished(file, name: name, to: target)
+            let result = await Self.saveFinished(file, name: name, folder: folder)
             self.delivering.remove(id)
             switch result {
             case .success(let saved):
@@ -1126,25 +1391,28 @@ final class DownloadManager: NSObject, ObservableObject {
         }
     }
 
-    nonisolated static func saveFinished(_ file: URL, name: String, to target: SaveTarget) async -> Result<SavedFile, Error> {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Result<SavedFile, Error>, Never>) in
+    nonisolated static func saveFinished(_ file: URL, name: String, folder: String?) async -> Result<FinishedFile, Error> {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Result<FinishedFile, Error>, Never>) in
             DownloadManager.fileQueue.async {
-                continuation.resume(returning: Result { try SaveLocation.save(file, name: name, to: target) })
+                continuation.resume(returning: Result { try DownloadManager.moveToDownloads(file, name: name, folder: folder) })
             }
         }
     }
 
-    /// Deletes a finished file, wherever it was saved.
-    nonisolated static func removeSaved(name: String, bookmark: Data?) {
-        if let bookmark {
-            DownloadManager.fileQueue.async { SaveLocation.deleteSaved(bookmark: bookmark) }
-        } else if !name.isEmpty {
-            try? FileManager.default.removeItem(at: downloadsDir.appendingPathComponent(name))
-        }
+    nonisolated private static func moveToDownloads(_ file: URL, name: String, folder: String?) throws -> FinishedFile {
+        var dir = downloadsDir
+        let sub = (folder ?? "").isEmpty ? nil : folder
+        if let sub { dir = dir.appendingPathComponent(sub, isDirectory: true) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = uniqueURL(for: name, in: dir)
+        try FileManager.default.moveItem(at: file, to: dest)
+        let path = sub.map { $0 + "/" + dest.lastPathComponent } ?? dest.lastPathComponent
+        return FinishedFile(url: dest, path: path, size: fileSize(dest))
     }
 
     /// Stops a download that keeps failing, keeping its progress so retry carries on.
-    private func failDownload(_ id: UUID, message: String, resolveAgain: Bool = false) {
+    /// `retryable`: the connection or a busy server was to blame, so it tries again by itself.
+    private func failDownload(_ id: UUID, message: String, resolveAgain: Bool = false, retryable: Bool = false) {
         turboStop(id)
         bgLive[id] = nil
         refreshProgress(id)
@@ -1157,7 +1425,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 $0.needsResolve = true
             }
         }
-        notifyFailed(id)
+        if !(retryable && planAutoRetry(id)) { notifyFailed(id) }
         clearTransfer(id)
         startNext()
         Task { await stopTransfers(for: id) }
@@ -1475,7 +1743,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 if let j = self.index(of: id), self.items[j].state == .downloading { self.drive(j) }
             }
         } else {
-            failDownload(id, message: message)
+            failDownload(id, message: message, retryable: true)
         }
     }
 
@@ -1582,6 +1850,7 @@ final class DownloadManager: NSObject, ObservableObject {
         let canStart = networkWait == nil
         return !workers.isEmpty || !absorbing.isEmpty || !delivering.isEmpty
             || items.contains { ($0.state == .queued && canStart) || $0.state == .resolving }
+            || (canStart && NetworkMonitor.shared.connected && waitingToRetry)
     }
 
     private func appWillResignActive() {
@@ -1756,7 +2025,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 failResolve(id, "TorBox: " + failure)
             } else if dl.ready {
                 beginFinishUpTime()   // starting the download may need a moment
-                torboxReady(id, webId: webId, files: dl.files)
+                torboxReady(id, webId: webId, download: dl)
             } else {
                 mutate(id, persist: false) {
                     $0.status = dl.statusText
@@ -1901,6 +2170,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 if let i = index(of: id) { drive(i) }
             }
             startNext()
+            runDueRetries()
         }
     }
 
@@ -2014,7 +2284,7 @@ final class DownloadManager: NSObject, ObservableObject {
         speeds[id] = nil
     }
 
-    fileprivate func finished(_ id: UUID, saved: SavedFile) {
+    fileprivate func finished(_ id: UUID, saved: FinishedFile) {
         clearTransfer(id)
         liveBytes[id] = nil
         bgLive[id] = nil
@@ -2027,15 +2297,14 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         guard items.contains(where: { $0.id == id }) else {
             // Deleted while it was finishing: don't leave the file behind.
-            Self.removeSaved(name: saved.name, bookmark: saved.bookmark)
+            try? FileManager.default.removeItem(at: saved.url)
+            Self.removeEmptyFolders(above: saved.url)
             return
         }
         mutate(id) {
             $0.state = .completed
-            $0.fileName = saved.name
-            $0.savedName = saved.name
-            $0.savedBookmark = saved.bookmark
-            $0.savedFolder = saved.folderName
+            $0.fileName = saved.url.lastPathComponent
+            $0.savedName = saved.path
             $0.bytesReceived = saved.size
             $0.bytesTotal = saved.size
             $0.completedAt = Date()
@@ -2043,12 +2312,32 @@ final class DownloadManager: NSObject, ObservableObject {
             $0.status = nil
             $0.segments = nil
             $0.layout = nil
+            $0.autoRetries = nil
+            $0.retryAt = nil
+            $0.retryMark = nil
         }
-        if let item = items.first(where: { $0.id == id }) { Notifier.shared.finished(item) }
+        if let item = items.first(where: { $0.id == id }) {
+            notifyFinished(item)
+            removeFromTorBoxIfDone(item)
+        }
         startNext()
     }
 
-    fileprivate func downloadFailed(_ id: UUID, message: String) {
+    /// One notification per file, or one for a whole torrent once all its files are in.
+    private func notifyFinished(_ item: DownloadItem) {
+        guard let group = item.groupID else {
+            Notifier.shared.finished(item)
+            return
+        }
+        let members = items.filter { $0.groupID == group }
+        if members.count < 2 {
+            Notifier.shared.finished(item)
+        } else if members.allSatisfy({ $0.state == .completed }) {
+            Notifier.shared.torrentFinished(name: item.groupName ?? item.fileName, files: members.count, group: group)
+        }
+    }
+
+    fileprivate func downloadFailed(_ id: UUID, message: String, retryable: Bool = false) {
         turboStop(id)
         clearTransfer(id)
         mutate(id) {
@@ -2061,7 +2350,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 $0.needsResolve = true
             }
         }
-        notifyFailed(id)
+        if !(retryable && planAutoRetry(id)) { notifyFailed(id) }
         startNext()
     }
 
@@ -2242,8 +2531,42 @@ final class DownloadManager: NSObject, ObservableObject {
         return (attrs?[.size] as? NSNumber)?.int64Value ?? 0
     }
 
-    nonisolated static func uniqueURL(for name: String) -> URL {
-        let base = downloadsDir
+    /// The folder inside Downloads for one file of a torrent: the torrent's own folder, then
+    /// the file's subfolders as they are in the torrent.
+    nonisolated static func torrentFolder(torrent: String, file path: String) -> String {
+        let root = safeComponent(torrent) ?? "Torrent"
+        var parts = path.split(separator: "/").compactMap { DownloadManager.safeComponent(String($0)) }
+        if !parts.isEmpty { parts.removeLast() }          // the file's own name
+        if parts.first == root { parts.removeFirst() }    // TorBox's paths start with the torrent's folder
+        return ([root] + parts).joined(separator: "/")
+    }
+
+    /// A name that's safe for a folder: no slashes or control characters, not "." or "..",
+    /// and not too long.
+    nonisolated static func safeComponent(_ raw: String) -> String? {
+        var name = raw.components(separatedBy: .controlCharacters).joined()
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while name.utf8.count > 200 { name.removeLast() }
+        if name.isEmpty || name == "." || name == ".." { return nil }
+        return name
+    }
+
+    /// Deletes folders inside Downloads that a deleted file has left empty.
+    nonisolated static func removeEmptyFolders(above file: URL) {
+        let fm = FileManager.default
+        let root = downloadsDir.standardizedFileURL.path
+        var dir = file.deletingLastPathComponent().standardizedFileURL
+        while dir.path.hasPrefix(root + "/") {
+            guard let contents = try? fm.contentsOfDirectory(atPath: dir.path),
+                  contents.allSatisfy({ $0 == ".DS_Store" }) else { return }
+            try? fm.removeItem(at: dir)
+            dir = dir.deletingLastPathComponent()
+        }
+    }
+
+    nonisolated static func uniqueURL(for name: String, in folder: URL? = nil) -> URL {
+        let base = folder ?? downloadsDir
         var candidate = base.appendingPathComponent(name)
         let ext = candidate.pathExtension
         let stem = candidate.deletingPathExtension().lastPathComponent
@@ -2340,7 +2663,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
         if downloadTask.response is HTTPURLResponse, !(200..<300).contains(status) {
             let detail = Self.smallJSON(at: location).flatMap { Self.message(in: $0) }
             let message = detail.map { "HTTP \(status): \($0)" } ?? "HTTP \(status)"
-            Task { @MainActor in self.downloadFailed(id, message: message) }
+            let busy = status == 429 || status >= 500
+            Task { @MainActor in self.downloadFailed(id, message: message, retryable: busy) }
             return
         }
 
@@ -2357,7 +2681,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         }
 
         // The temp file is deleted when this method returns, so move it now; it then goes
-        // where files are saved.
+        // into Downloads.
         let name = Self.cleanName(tag.name ?? downloadTask.response?.suggestedFilename ?? "download")
         let holding = Self.dataURL(id)
         do {
@@ -2404,15 +2728,18 @@ extension DownloadManager: URLSessionDownloadDelegate {
             Task { @MainActor in self.partFailed(id, part: part, message: msg, resumeData: data) }
             return
         }
+        let retryable = TurboWorker.isRetryable(error)
         Task { @MainActor in
             self.clearTransfer(id)
+            var failedNow = false
             self.mutate(id) {
                 guard $0.state == .downloading else { return }
                 $0.state = .failed
                 $0.error = msg
                 $0.resumeData = data
+                failedNow = true
             }
-            self.notifyFailed(id)
+            if failedNow, !(retryable && self.planAutoRetry(id)) { self.notifyFailed(id) }
             self.advance()
         }
     }
