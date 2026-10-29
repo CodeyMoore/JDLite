@@ -1,6 +1,7 @@
 import SwiftUI
 
 /// What's in your TorBox account: download things again, or remove them from TorBox.
+/// Select picks several of them (or all) to download or remove at once.
 struct TorBoxCloudView: View {
     @EnvironmentObject var manager: DownloadManager
     @ObservedObject private var torbox = TorBox.shared
@@ -11,34 +12,105 @@ struct TorBoxCloudView: View {
     @State private var loaded = false
     @State private var problem: String?
     @State private var note: String?
+    @State private var working: String?
     @State private var choosing: TorBoxCloudItem?
-    @State private var removing: TorBoxCloudItem?
+    @State private var removing: [TorBoxCloudItem] = []
     @State private var confirmingRemove = false
+    @State private var editMode: EditMode = .inactive
+    @State private var selection = Set<String>()
+
+    private var selecting: Bool { editMode.isEditing }
+
+    /// Everything on the screen, in the order it's shown.
+    private var entries: [TorBoxCloudItem] { torrents + webDownloads }
+
+    private var selectedEntries: [TorBoxCloudItem] {
+        entries.filter { selection.contains($0.id) }
+    }
+
+    /// How many of the selected items TorBox has finished, so they can be downloaded.
+    private var selectedReadyCount: Int {
+        selectedEntries.filter { $0.ready }.count
+    }
+
+    private var allSelected: Bool {
+        let ids = Set(entries.map { $0.id })
+        return !ids.isEmpty && ids.isSubset(of: selection)
+    }
+
+    /// Rows can only be selected in Select mode, so a stray tap can't pre-select one.
+    private var selectionBinding: Binding<Set<String>> {
+        Binding(get: { selection }, set: { newValue in
+            if selecting { selection = newValue }
+        })
+    }
 
     var body: some View {
         NavigationStack {
             content
+                .environment(\.editMode, $editMode)
                 .navigationTitle("TorBox Cloud")
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
-                }
+                .toolbar { toolbarContent }
                 .navigationDestination(item: $choosing) { entry in
                     TorrentFilesView(title: entry.name, files: entry.files) { chosen in
                         add(entry, files: entry.files.filter { chosen.contains($0.id) })
                     }
                 }
                 .confirmationDialog(removeTitle, isPresented: $confirmingRemove, titleVisibility: .visible,
-                                    presenting: removing) { entry in
+                                    presenting: removing) { picked in
                     Button("Remove From TorBox", role: .destructive) {
-                        Task { await remove(entry) }
+                        finishSelecting()
+                        Task { await removeFromTorBox(picked) }
                     }
                     Button("Cancel", role: .cancel) {}
-                } message: { _ in
-                    Text("It's deleted from your TorBox account. Files you've already downloaded stay on this device.")
+                } message: { picked in
+                    Text(removeMessage(picked))
                 }
         }
         .task { await load() }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        if selecting {
+            ToolbarItem(placement: .topBarLeading) {
+                Button(allSelected ? "Deselect All" : "Select All") {
+                    selection = allSelected ? [] : Set(entries.map { $0.id })
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Done") { finishSelecting() }
+                    .fontWeight(.semibold)
+            }
+            ToolbarItemGroup(placement: .bottomBar) {
+                Button(role: .destructive) {
+                    askToRemove(selectedEntries)
+                } label: {
+                    Label(selectedEntries.isEmpty ? "Remove" : "Remove (\(selectedEntries.count))",
+                          systemImage: "trash")
+                        .labelStyle(.titleAndIcon)
+                }
+                .disabled(selectedEntries.isEmpty)
+                Spacer()
+                Button {
+                    downloadSelected()
+                } label: {
+                    Label(selectedReadyCount == 0 ? "Download" : "Download (\(selectedReadyCount))",
+                          systemImage: "arrow.down.circle")
+                        .labelStyle(.titleAndIcon)
+                }
+                .disabled(selectedReadyCount == 0)
+            }
+        } else {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Select") { editMode = .active }
+                    .disabled(!loaded || entries.isEmpty || working != nil)
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Done") { dismiss() }
+            }
+        }
     }
 
     @ViewBuilder
@@ -48,7 +120,7 @@ struct TorBoxCloudView: View {
                                    description: Text("Add your TorBox API key in ⋯ › TorBox first."))
         } else if !loaded {
             ProgressView("Loading your TorBox…")
-        } else if torrents.isEmpty && webDownloads.isEmpty {
+        } else if entries.isEmpty {
             if let problem {
                 ContentUnavailableView {
                     Label("Couldn't load TorBox", systemImage: "exclamationmark.triangle")
@@ -67,16 +139,26 @@ struct TorBoxCloudView: View {
     }
 
     private var list: some View {
-        List {
-            if let note {
-                Section {
-                    Label(note, systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+        List(selection: selectionBinding) {
+            if !selecting {
+                if let working {
+                    Section {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text(working)
+                        }
+                    }
                 }
-            }
-            if let problem {
-                Section {
-                    Text(problem).foregroundStyle(.red)
+                if let note {
+                    Section {
+                        Label(note, systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+                if let problem {
+                    Section {
+                        Text(problem).foregroundStyle(.red)
+                    }
                 }
             }
             if !torrents.isEmpty {
@@ -89,10 +171,12 @@ struct TorBoxCloudView: View {
                     ForEach(webDownloads) { entry in row(entry) }
                 }
             }
-            Section {
-                EmptyView()
-            } footer: {
-                Text("Tap the arrow to download something again. Swipe left to remove it from TorBox. To have TorBox cleared out by itself, turn on Remove From TorBox When Done in ⋯ › TorBox.")
+            if !selecting {
+                Section {
+                    EmptyView()
+                } footer: {
+                    Text("Tap the arrow to download something again, or tap Select to download or remove several at once. Swipe left to remove one from TorBox. To have TorBox cleared out by itself, turn on Remove From TorBox When Done in ⋯ › TorBox.")
+                }
             }
         }
         .refreshable { await load() }
@@ -110,7 +194,7 @@ struct TorBoxCloudView: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 8)
-            if entry.ready {
+            if entry.ready && !selecting {
                 Button {
                     download(entry)
                 } label: {
@@ -121,14 +205,16 @@ struct TorBoxCloudView: View {
             }
         }
         .padding(.vertical, 2)
+        .tag(entry.id)
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            Button {
-                removing = entry
-                confirmingRemove = true
-            } label: {
-                Label("Remove", systemImage: "trash")
+            if working == nil {
+                Button {
+                    askToRemove([entry])
+                } label: {
+                    Label("Remove", systemImage: "trash")
+                }
+                .tint(.red)
             }
-            .tint(.red)
         }
     }
 
@@ -141,9 +227,12 @@ struct TorBoxCloudView: View {
         return parts.joined(separator: " · ")
     }
 
-    private var removeTitle: String {
-        "Remove “\(removing?.name ?? "this")” from TorBox?"
+    private func finishSelecting() {
+        editMode = .inactive
+        selection = []
     }
+
+    // MARK: Downloading
 
     /// A torrent with several files asks which ones first.
     private func download(_ entry: TorBoxCloudItem) {
@@ -155,16 +244,125 @@ struct TorBoxCloudView: View {
     }
 
     private func add(_ entry: TorBoxCloudItem, files: [TorBoxFile]) {
-        let count = manager.addFromTorBox(entry, files: files)
+        note = addedText(manager.addFromTorBox(entry, files: files))
+    }
+
+    /// Downloads every file of each selected item that TorBox has finished. The rest are skipped.
+    private func downloadSelected() {
+        let picked = selectedEntries
+        let ready = picked.filter { $0.ready }
+        guard !ready.isEmpty else { return }
+        var added = 0
+        for entry in ready {
+            added += manager.addFromTorBox(entry, files: entry.files)
+        }
+        finishSelecting()
+        var text = addedText(added)
+        let skipped = picked.count - ready.count
+        if skipped == 1 {
+            text += " 1 item wasn't ready on TorBox yet, so it was skipped."
+        } else if skipped > 1 {
+            text += " \(skipped) items weren't ready on TorBox yet, so they were skipped."
+        }
+        note = text
+    }
+
+    private func addedText(_ count: Int) -> String {
         switch count {
-        case 0: note = "Those files are already in your downloads."
-        case 1: note = "Added 1 file to your downloads."
-        default: note = "Added \(count) files to your downloads."
+        case 0: return "Those files are already in your downloads."
+        case 1: return "Added 1 file to your downloads."
+        default: return "Added \(count) files to your downloads."
+        }
+    }
+
+    // MARK: Removing
+
+    private func askToRemove(_ picked: [TorBoxCloudItem]) {
+        guard !picked.isEmpty else { return }
+        removing = picked
+        confirmingRemove = true
+    }
+
+    private var removeTitle: String {
+        if removing.count == 1, let only = removing.first {
+            return "Remove “\(only.name)” from TorBox?"
+        }
+        return "Remove \(removing.count) items from TorBox?"
+    }
+
+    /// Also warns about anything that hasn't finished downloading here yet.
+    private func removeMessage(_ picked: [TorBoxCloudItem]) -> String {
+        let one = picked.count == 1
+        var text = one
+            ? "It's deleted from your TorBox account. Files you've already downloaded stay on this device."
+            : "They're deleted from your TorBox account. Files you've already downloaded stay on this device."
+        let unfinished = picked.filter { unfinishedHere($0) }.count
+        if one && unfinished == 1 {
+            text += " It hasn't finished downloading here yet, and may not be able to once it's gone from TorBox."
+        } else if unfinished == 1 {
+            text += " 1 of them hasn't finished downloading here yet, and may not be able to once it's gone from TorBox."
+        } else if unfinished > 1 {
+            text += " \(unfinished) of them haven't finished downloading here yet, and may not be able to once they're gone from TorBox."
+        }
+        return text
+    }
+
+    /// True when the downloads list has files from this item that aren't finished.
+    private func unfinishedHere(_ entry: TorBoxCloudItem) -> Bool {
+        manager.items.contains {
+            $0.torboxId == entry.torboxID && ($0.torboxKind ?? .web) == entry.kind && $0.state != .completed
+        }
+    }
+
+    /// Removes them one at a time, a moment apart, since TorBox limits how fast its API can be used.
+    private func removeFromTorBox(_ picked: [TorBoxCloudItem]) async {
+        guard !picked.isEmpty, working == nil else { return }
+        var removed = 0
+        var failures: [String] = []
+        for (index, entry) in picked.enumerated() {
+            working = picked.count == 1
+                ? "Removing from TorBox…"
+                : "Removing \(index + 1) of \(picked.count) from TorBox…"
+            if index > 0 { try? await Task.sleep(nanoseconds: 250_000_000) }
+            do {
+                try await removeOne(entry)
+                torrents.removeAll { $0.id == entry.id }
+                webDownloads.removeAll { $0.id == entry.id }
+                removed += 1
+            } catch {
+                failures.append(error.localizedDescription)
+            }
+        }
+        working = nil
+        if !failures.isEmpty { await load() }   // show what's really still on TorBox
+
+        if removed == 0 {
+            note = nil
+        } else if picked.count == 1 {
+            note = "Removed “\(picked[0].name)” from TorBox."
+        } else {
+            note = removed == 1 ? "Removed 1 item from TorBox." : "Removed \(removed) items from TorBox."
+        }
+        if let first = failures.first {
+            let what = picked.count == 1 ? "it" : (failures.count == 1 ? "1 item" : "\(failures.count) items")
+            problem = "Couldn't remove \(what): " + first
+        } else {
+            problem = nil
+        }
+    }
+
+    /// Tries once more after a pause, in case TorBox was busy.
+    private func removeOne(_ entry: TorBoxCloudItem) async throws {
+        do {
+            try await torbox.remove(entry.kind, id: entry.torboxID)
+        } catch {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try await torbox.remove(entry.kind, id: entry.torboxID)
         }
     }
 
     private func load() async {
-        guard torbox.hasKey, !loading else { return }
+        guard torbox.hasKey, !loading, working == nil else { return }
         loading = true
         var problems: [String] = []
         do {
@@ -180,18 +378,11 @@ struct TorBoxCloudView: View {
         problem = problems.first.map { "Couldn't load everything from TorBox: " + $0 }
         loading = false
         loaded = true
-    }
 
-    private func remove(_ entry: TorBoxCloudItem) async {
-        do {
-            try await torbox.remove(entry.kind, id: entry.torboxID)
-            torrents.removeAll { $0.id == entry.id }
-            webDownloads.removeAll { $0.id == entry.id }
-            note = "Removed “\(entry.name)” from TorBox."
-            problem = nil
-        } catch {
-            problem = "Couldn't remove it: " + error.localizedDescription
-        }
+        // Forget selected items that aren't on TorBox any more.
+        let ids = Set(entries.map { $0.id })
+        selection = selection.intersection(ids)
+        if ids.isEmpty { finishSelecting() }
     }
 }
 
