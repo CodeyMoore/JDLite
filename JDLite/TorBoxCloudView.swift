@@ -1,11 +1,11 @@
 import SwiftUI
 
 /// What's in your TorBox account: download things again, or remove them from TorBox.
-/// Select picks several of them (or all) to download or remove at once.
+/// Select picks several of them (or all) to download or remove at once. Opened from the
+/// TorBox screen.
 struct TorBoxCloudView: View {
     @EnvironmentObject var manager: DownloadManager
     @ObservedObject private var torbox = TorBox.shared
-    @Environment(\.dismiss) private var dismiss
     @State private var torrents: [TorBoxCloudItem] = []
     @State private var webDownloads: [TorBoxCloudItem] = []
     @State private var loading = false
@@ -46,29 +46,28 @@ struct TorBoxCloudView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            content
-                .environment(\.editMode, $editMode)
-                .navigationTitle("TorBox Cloud")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar { toolbarContent }
-                .navigationDestination(item: $choosing) { entry in
-                    TorrentFilesView(title: entry.name, files: entry.files) { chosen in
-                        add(entry, files: entry.files.filter { chosen.contains($0.id) })
-                    }
+        content
+            .environment(\.editMode, $editMode)
+            .navigationTitle("TorBox Cloud")
+            .navigationBarTitleDisplayMode(.inline)
+            .navigationBarBackButtonHidden(selecting)
+            .toolbar { toolbarContent }
+            .navigationDestination(item: $choosing) { entry in
+                TorrentFilesView(title: entry.name, files: entry.files) { chosen in
+                    add(entry, files: entry.files.filter { chosen.contains($0.id) })
                 }
-                .confirmationDialog(removeTitle, isPresented: $confirmingRemove, titleVisibility: .visible,
-                                    presenting: removing) { picked in
-                    Button("Remove From TorBox", role: .destructive) {
-                        finishSelecting()
-                        Task { await removeFromTorBox(picked) }
-                    }
-                    Button("Cancel", role: .cancel) {}
-                } message: { picked in
-                    Text(removeMessage(picked))
+            }
+            .confirmationDialog(removeTitle, isPresented: $confirmingRemove, titleVisibility: .visible,
+                                presenting: removing) { picked in
+                Button("Remove From TorBox", role: .destructive) {
+                    finishSelecting()
+                    Task { await removeFromTorBox(picked) }
                 }
-        }
-        .task { await load() }
+                Button("Cancel", role: .cancel) {}
+            } message: { picked in
+                Text(removeMessage(picked))
+            }
+            .task { await load() }
     }
 
     @ToolbarContentBuilder
@@ -103,12 +102,9 @@ struct TorBoxCloudView: View {
                 .disabled(selectedReadyCount == 0)
             }
         } else {
-            ToolbarItem(placement: .topBarLeading) {
+            ToolbarItem(placement: .topBarTrailing) {
                 Button("Select") { editMode = .active }
                     .disabled(!loaded || entries.isEmpty || working != nil)
-            }
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Done") { dismiss() }
             }
         }
     }
@@ -117,7 +113,7 @@ struct TorBoxCloudView: View {
     private var content: some View {
         if !torbox.hasKey {
             ContentUnavailableView("No TorBox account", systemImage: "key",
-                                   description: Text("Add your TorBox API key in ⋯ › TorBox first."))
+                                   description: Text("Add your TorBox API key on the TorBox screen first."))
         } else if !loaded {
             ProgressView("Loading your TorBox…")
         } else if entries.isEmpty {
@@ -175,7 +171,7 @@ struct TorBoxCloudView: View {
                 Section {
                     EmptyView()
                 } footer: {
-                    Text("Tap the arrow to download something again, or tap Select to download or remove several at once. Swipe left to remove one from TorBox. To have TorBox cleared out by itself, turn on Remove From TorBox When Done in ⋯ › TorBox.")
+                    Text("Tap the arrow to download something again, or tap Select to download or remove several at once. Swipe left to remove one from TorBox. To have TorBox cleared out by itself, turn on Remove From TorBox When Done on the TorBox screen.")
                 }
             }
         }

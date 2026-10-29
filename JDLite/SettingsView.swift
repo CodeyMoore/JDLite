@@ -51,7 +51,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Torrents")
                 } footer: {
-                    Text("When a torrent has more than one file, JDLite asks which ones to download once TorBox has it. A torrent's files go into a folder named after it in Downloads, laid out as in the torrent, and show as one group in the list.")
+                    Text("When a torrent has more than one file, JDLite asks which ones to download once TorBox or Offcloud has it. A torrent's files go into a folder named after it in Downloads, laid out as in the torrent, and show as one group in the list.")
                 }
 
                 Section {
@@ -70,6 +70,16 @@ struct SettingsView: View {
                     Toggle("Live Activity", isOn: $settings.liveActivityEnabled)
                 } footer: {
                     Text("Shows download progress on the Lock Screen and in the Dynamic Island.")
+                }
+
+                Section {
+                    NavigationLink {
+                        PluginsView()
+                    } label: {
+                        Label("Plugins", systemImage: "puzzlepiece.extension")
+                    }
+                } footer: {
+                    Text("Plugins find the file behind links from some sites.")
                 }
 
                 Section {

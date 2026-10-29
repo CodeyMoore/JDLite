@@ -35,7 +35,16 @@ struct TorBoxView: View {
                     } header: {
                         Text("Account")
                     } footer: {
-                        Text("Links from supported sites download through your TorBox account. TorBox may ask you to log in to see the list.\n\nWith Remove From TorBox When Done, a download is deleted from your TorBox account once all its files are on this device. See what's on TorBox in ⋯ › TorBox Cloud.")
+                        Text("Links from supported sites download through your TorBox account. TorBox may ask you to log in to see the list.\n\nWith Remove From TorBox When Done, a download is deleted from your TorBox account once all its files are on this device.")
+                    }
+                    Section {
+                        NavigationLink {
+                            TorBoxCloudView()
+                        } label: {
+                            Label("TorBox Cloud", systemImage: "icloud.and.arrow.down")
+                        }
+                    } footer: {
+                        Text("See what's in your TorBox account: download things again, or remove them from TorBox.")
                     }
                 }
                 Section {

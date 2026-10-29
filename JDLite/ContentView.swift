@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     enum Sheet: Identifiable, Hashable {
-        case add, torbox, cloud, plugins, settings
+        case add, torbox, offcloud, settings
         case chooseFiles(UUID)
         var id: Self { self }
     }
@@ -151,8 +151,7 @@ struct ContentView: View {
                 switch s {
                 case .add: AddLinksView()
                 case .torbox: TorBoxView()
-                case .cloud: TorBoxCloudView()
-                case .plugins: PluginsView()
+                case .offcloud: OffcloudView()
                 case .settings: SettingsView()
                 case .chooseFiles(let id):
                     ChooseFilesSheet(itemID: id, item: manager.items.first(where: { $0.id == id }))
@@ -274,8 +273,7 @@ struct ContentView: View {
             ToolbarItem(placement: .topBarLeading) {
                 Menu {
                     Button("TorBox", systemImage: "cloud") { sheet = .torbox }
-                    Button("TorBox Cloud", systemImage: "icloud.and.arrow.down") { sheet = .cloud }
-                    Button("Plugins", systemImage: "puzzlepiece.extension") { sheet = .plugins }
+                    Button("Offcloud", systemImage: "icloud") { sheet = .offcloud }
                     Button("Settings", systemImage: "gearshape") { sheet = .settings }
                     Divider()
                     Button("Pause All", systemImage: "pause.circle") { manager.pauseAll() }
@@ -719,7 +717,7 @@ struct DownloadRow: View {
         case .downloading:
             return BarStyle(fraction: item.bytesTotal > 0 ? item.progress : nil, tint: .accentColor)
         case .resolving:
-            return item.torboxId != nil ? BarStyle(fraction: item.cloudProgress, tint: .purple) : nil
+            return item.torboxId != nil || item.offcloudId != nil ? BarStyle(fraction: item.cloudProgress, tint: .purple) : nil
         case .choosing:
             return nil
         case .paused:
@@ -739,12 +737,12 @@ struct DownloadRow: View {
         switch item.state {
         case .queued:
             if let status = item.status { return status }   // "Waiting for Wi-Fi…"
-            return item.torboxId != nil ? "Queued · via TorBox" : "Queued"
+            return item.serviceName.map { "Queued · via " + $0 } ?? "Queued"
         case .resolving:
             return item.status ?? "Resolving…"
         case .choosing:
             let count = item.choices?.count ?? 0
-            return "\(count) files ready on TorBox · Choose which to download"
+            return "\(count) files ready on \(item.serviceName ?? "TorBox") · Choose which to download"
         case .downloading:
             if let status = item.status { return status }   // "Connecting…", "Waiting for TorBox…"
             var parts: [String] = []
@@ -872,7 +870,7 @@ struct DownloadDetails: View {
             r.append(DetailRow("Connections", "\(connections)"))
         }
         if item.state == .resolving, let p = item.cloudProgress {
-            r.append(DetailRow("TorBox", "\(Int(p * 100))% fetched"))
+            r.append(DetailRow(item.serviceName ?? "TorBox", "\(Int(p * 100))% fetched"))
         }
         if item.state == .choosing, let files = item.choices {
             r.append(DetailRow("Files", "\(files.count) to choose from"))
@@ -885,9 +883,9 @@ struct DownloadDetails: View {
             r.append(DetailRow("From", "Your TorBox cloud"))
         } else if item.torboxKind == .torrent {
             let kind = source.isFileURL ? ".torrent file" : (source.scheme == "magnet" ? "Magnet link" : (source.host ?? "Torrent"))
-            r.append(DetailRow("From", kind + " via TorBox"))
+            r.append(DetailRow("From", kind + (item.serviceName.map { " via " + $0 } ?? "")))
         } else {
-            r.append(DetailRow("From", (source.host ?? source.absoluteString) + (item.torboxId != nil ? " via TorBox" : "")))
+            r.append(DetailRow("From", (source.host ?? source.absoluteString) + (item.serviceName.map { " via " + $0 } ?? "")))
         }
         if item.state == .completed, let name = item.savedFileName {
             r.append(DetailRow("Saved as", "Downloads/" + name))
@@ -904,7 +902,11 @@ struct DownloadDetails: View {
     private var statusWord: String {
         switch item.state {
         case .queued: return "Queued"
-        case .resolving: return item.torboxId != nil ? "TorBox is fetching it" : "Finding the file"
+        case .resolving:
+            if let service = item.serviceName, item.torboxId != nil || item.offcloudId != nil {
+                return service + " is fetching it"
+            }
+            return "Finding the file"
         case .choosing: return "Ready: pick which files to download"
         case .downloading: return "Downloading"
         case .paused: return "Paused"
@@ -991,7 +993,7 @@ struct FileBadge: View {
         switch item.state {
         case .completed: return .green
         case .failed: return .red
-        case .resolving: return item.torboxId != nil ? .purple : .accentColor
+        case .resolving: return item.torboxId != nil || item.offcloudId != nil ? .purple : .accentColor
         case .choosing: return .purple
         case .paused, .queued: return .gray
         case .downloading: return .accentColor
@@ -1081,7 +1083,7 @@ struct AddLinksView: View {
                     Label("Add .torrent Files…", systemImage: "doc.badge.plus")
                 }
                 .padding(.top, 8)
-                Text("Magnet links and .torrent files download through TorBox.")
+                Text("Magnet links and .torrent files download through TorBox or Offcloud.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Spacer()

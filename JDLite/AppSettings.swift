@@ -62,6 +62,11 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(removeFromTorBox, forKey: "removeFromTorBox") }
     }
 
+    /// When TorBox and Offcloud can both get a link or torrent, try Offcloud first.
+    @Published var preferOffcloud: Bool {
+        didSet { defaults.set(preferOffcloud, forKey: "preferOffcloud") }
+    }
+
     /// Notify when downloads finish or fail while the app isn't open.
     @Published var notificationsEnabled: Bool {
         didSet {
@@ -96,6 +101,7 @@ final class AppSettings: ObservableObject {
         _askTorrentFiles = Published(wrappedValue: d.object(forKey: "askTorrentFiles") as? Bool ?? true)
         _autoRetry = Published(wrappedValue: d.object(forKey: "autoRetry") as? Bool ?? true)
         _removeFromTorBox = Published(wrappedValue: d.object(forKey: "removeFromTorBox") as? Bool ?? false)
+        _preferOffcloud = Published(wrappedValue: d.object(forKey: "preferOffcloud") as? Bool ?? false)
         _notificationsEnabled = Published(wrappedValue: d.object(forKey: "notificationsEnabled") as? Bool ?? true)
         _liveActivityEnabled = Published(wrappedValue: d.object(forKey: "liveActivityEnabled") as? Bool ?? true)
     }

@@ -2,12 +2,13 @@ import Foundation
 import Security
 import Combine
 
-/// One file in a TorBox download or torrent.
+/// One file in a TorBox or Offcloud download or torrent.
 struct TorBoxFile: Codable, Hashable, Sendable {
     var id: Int
     var name: String          // the file's own name
     var size: Int64?
     var path: String?         // where it is in the torrent, e.g. "Show S01/Subs/English.srt"
+    var link: URL? = nil      // Offcloud: the file's own download link
 }
 
 /// What TorBox fetches: a link from a file host, or a torrent (magnet link or .torrent file).

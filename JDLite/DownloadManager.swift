@@ -2,7 +2,7 @@ import Foundation
 import Combine
 import UIKit
 
-/// `choosing`: a torrent is ready on TorBox and waits for you to pick which files to download.
+/// `choosing`: a torrent is ready on TorBox or Offcloud and waits for you to pick which files to download.
 enum DownloadState: String, Codable { case queued, resolving, choosing, downloading, paused, completed, failed }
 
 /// One byte range of a file. In-app connections write it straight into the download's data
@@ -74,8 +74,23 @@ struct DownloadItem: Identifiable, Codable {
     var autoRetries: Int?            // tries it made by itself after the connection dropped
     var retryAt: Date?               // when it tries again by itself
     var retryMark: Int64?            // how far it had got at the last of those tries
+    var offcloudId: String?          // Offcloud request ID: a torrent (or link) it fetches to its cloud
+    var offcloudFile: Bool?          // the link is a file in your Offcloud cloud, so it's never looked up again
+    var viaOffcloud: Bool?           // Offcloud gave the link
+    var askOffcloud: Bool?           // the next look-up sends the link to Offcloud even if Offcloud doesn't list the site
+    var triedServices: [String]?     // TorBox/Offcloud, if they couldn't get it this time
 
     var progress: Double { bytesTotal > 0 ? min(Double(bytesReceived) / Double(bytesTotal), 1) : 0 }
+
+    /// A file in TorBox's or Offcloud's cloud: its link stays the same, so it's never looked up again.
+    var isCloudFile: Bool { torboxFileId != nil || offcloudFile == true }
+
+    /// The service the file comes through, if any.
+    var serviceName: String? {
+        if torboxId != nil { return "TorBox" }
+        if offcloudId != nil || viaOffcloud == true { return "Offcloud" }
+        return nil
+    }
 
     /// The finished file's path inside Downloads (with its folder), if there is one.
     var savedFileName: String? { savedName ?? (state == .completed ? fileName : nil) }
@@ -122,6 +137,8 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private var torboxPoller: Task<Void, Never>?
     private var pollSoon = false
+    private var offcloudPoller: Task<Void, Never>?
+    private var offcloudPollSoon = false
     private var samples: [UUID: (time: TimeInterval, bytes: Int64)] = [:]
     private var liveBytes: [UUID: [Int64: Int64]] = [:]  // background part progress not yet copied into items
     private var bgLive: [UUID: Set<Int64>] = [:]         // parts a background transfer is fetching
@@ -290,6 +307,8 @@ final class DownloadManager: NSObject, ObservableObject {
             if !automatic {
                 $0.autoRetries = nil
                 $0.retryMark = nil
+                $0.triedServices = nil   // a retry you ask for gives TorBox and Offcloud another go
+                $0.askOffcloud = nil
             }
         }
         if item.needsResolve == true {
@@ -458,7 +477,7 @@ final class DownloadManager: NSObject, ObservableObject {
         return Data(base64Encoded: b64)
     }
 
-    // MARK: Resolving: plugins first, then TorBox, otherwise download the link directly
+    // MARK: Resolving: plugins first, then TorBox or Offcloud, otherwise download the link directly
 
     private func runResolve(_ id: UUID) async {
         guard let item = items.first(where: { $0.id == id }), item.state == .resolving else { return }
@@ -476,9 +495,21 @@ final class DownloadManager: NSObject, ObservableObject {
             return
         }
 
-        // Torrents (magnet links, .torrent files, links to .torrent files) are fetched by TorBox.
+        // Already handed to Offcloud's cloud.
+        if item.offcloudId != nil {
+            if item.offcloudFile == true {
+                mutate(id) { $0.state = .queued; $0.needsResolve = nil; $0.status = nil }
+                startNext()
+            } else {
+                setStatus(id, "Waiting for Offcloud…")
+                startOffcloudPolling()
+            }
+            return
+        }
+
+        // Torrents (magnet links, .torrent files, links to .torrent files) are fetched by TorBox or Offcloud.
         if item.torboxKind == .torrent || item.torrentFile != nil
-            || (link.pathExtension.lowercased() == "torrent" && TorBox.shared.isActive) {
+            || (link.pathExtension.lowercased() == "torrent" && (TorBox.shared.isActive || Offcloud.shared.isActive)) {
             await sendTorrent(id, item: item, link: link)
             return
         }
@@ -496,20 +527,25 @@ final class DownloadManager: NSObject, ObservableObject {
             return
         }
 
-        if await TorBox.shared.supports(link) {
-            guard isResolving(id) else { return }
-            setStatus(id, "Sending to TorBox…")
-            do {
-                let webId = try await TorBox.shared.create(link: link)
-                guard items.contains(where: { $0.id == id }) else { return }
-                mutate(id) { $0.torboxId = webId }
+        // Sites TorBox or Offcloud supports: the one you prefer first, then the other if that
+        // one couldn't get the file.
+        let tried = item.triedServices ?? []
+        for service in preferredServices where !tried.contains(service.rawValue) {
+            switch service {
+            case .torbox:
+                guard await TorBox.shared.supports(link) else { continue }
                 guard isResolving(id) else { return }
-                setStatus(id, "Waiting for TorBox…")
-                startTorBoxPolling(restart: true)
-            } catch {
-                failResolve(id, "TorBox: " + error.localizedDescription)
+                await sendToTorBox(id, link: link)
+                return
+            case .offcloud:
+                guard Offcloud.shared.isActive else { continue }
+                var listed = item.askOffcloud == true
+                if !listed { listed = await Offcloud.shared.supports(link) }
+                guard listed else { continue }
+                guard isResolving(id) else { return }
+                await sendToOffcloud(id, link: link)
+                return
             }
-            return
         }
 
         guard isResolving(id) else { return }
@@ -517,13 +553,160 @@ final class DownloadManager: NSObject, ObservableObject {
         startNext()
     }
 
-    private func sendTorrent(_ id: UUID, item: DownloadItem, link: URL) async {
-        guard TorBox.shared.isActive else {
-            failResolve(id, TorBox.shared.hasKey
-                ? "Torrents download through TorBox, which is switched off in ⋯ › TorBox."
-                : "Torrents and magnet links download through TorBox. Add your TorBox API key in ⋯ › TorBox, then tap retry.")
+    /// TorBox and Offcloud, the one you prefer first (TorBox unless you picked Offcloud).
+    private var preferredServices: [PremiumService] {
+        AppSettings.shared.preferOffcloud ? [.offcloud, .torbox] : [.torbox, .offcloud]
+    }
+
+    private func isActive(_ service: PremiumService) -> Bool {
+        service == .torbox ? TorBox.shared.isActive : Offcloud.shared.isActive
+    }
+
+    /// TorBox or Offcloud couldn't get a link or torrent. The other one has a go if it's set up
+    /// (for a link, if TorBox supports its site); otherwise the download fails with the message.
+    private func serviceFailed(_ id: UUID, _ service: PremiumService, _ message: String) async {
+        guard isResolving(id), let item = items.first(where: { $0.id == id }) else { return }
+        var tried = item.triedServices ?? []
+        if !tried.contains(service.rawValue) { tried.append(service.rawValue) }
+        let torrent = item.torboxKind == .torrent || item.torrentFile != nil
+        let link = item.sourceURL ?? item.url
+        var next: PremiumService?
+        for other in preferredServices where !tried.contains(other.rawValue) && isActive(other) {
+            if other == .torbox && !torrent {
+                guard await TorBox.shared.supports(link) else { continue }
+            }
+            next = other
+            break
+        }
+        guard let next, isResolving(id) else {
+            mutate(id, persist: false) {
+                $0.triedServices = nil
+                $0.askOffcloud = nil
+            }
+            failResolve(id, message)
             return
         }
+        mutate(id) {
+            $0.triedServices = tried
+            $0.askOffcloud = next == .offcloud ? true : nil
+            $0.status = "\(service.name) couldn't get it. Trying \(next.name)…"
+        }
+        await runResolve(id)
+    }
+
+    /// A link from a site TorBox supports goes to TorBox, which fetches the file for us.
+    private func sendToTorBox(_ id: UUID, link: URL) async {
+        setStatus(id, "Sending to TorBox…")
+        do {
+            let webId = try await TorBox.shared.create(link: link)
+            guard items.contains(where: { $0.id == id }) else { return }
+            mutate(id) { $0.torboxId = webId }
+            guard isResolving(id) else { return }
+            setStatus(id, "Waiting for TorBox…")
+            startTorBoxPolling(restart: true)
+        } catch is URLError {
+            failResolve(id, "TorBox: can't connect.", retryable: true)
+        } catch {
+            await serviceFailed(id, .torbox, "TorBox: " + error.localizedDescription)
+        }
+    }
+
+    /// Gets a link through Offcloud. Most sites give a direct link at once; sites Offcloud only
+    /// fetches to its cloud (or that don't get an instant link) go through the cloud instead.
+    private func sendToOffcloud(_ id: UUID, link: URL) async {
+        mutate(id, persist: false) { $0.askOffcloud = nil }
+        if !Offcloud.shared.onlyThroughCloud(link) {
+            setStatus(id, "Asking Offcloud…")
+            do {
+                let got = try await Offcloud.shared.instant(link)
+                guard isResolving(id) else { return }
+                mutate(id) {
+                    $0.url = got.url
+                    if let name = got.fileName {
+                        $0.fileName = Self.cleanName(name)
+                        $0.preferredName = Self.cleanName(name)
+                    }
+                    $0.sourceURL = link
+                    $0.headers = nil
+                    $0.viaOffcloud = true
+                    $0.triedServices = nil
+                    $0.state = .queued
+                    $0.needsResolve = nil
+                    $0.status = nil
+                    $0.error = nil
+                }
+                startNext()
+                return
+            } catch let error as OffcloudError where error.triesCloud {
+                // No instant link: Offcloud's cloud may still be able to fetch it.
+            } catch {
+                await offcloudFailed(id, error)
+                return
+            }
+        }
+        await sendToOffcloudCloud(id, link: link.absoluteString)
+    }
+
+    /// Hands a link or magnet link to Offcloud's cloud, then waits for Offcloud to fetch it.
+    private func sendToOffcloudCloud(_ id: UUID, link: String) async {
+        guard isResolving(id) else { return }
+        setStatus(id, "Sending to Offcloud…")
+        do {
+            let requestId = try await Offcloud.shared.addToCloud(link)
+            guard items.contains(where: { $0.id == id }) else { return }
+            mutate(id) {
+                $0.offcloudId = requestId
+                $0.viaOffcloud = true
+            }
+            guard isResolving(id) else { return }
+            setStatus(id, "Waiting for Offcloud…")
+            startOffcloudPolling(restart: true)
+        } catch {
+            await offcloudFailed(id, error)
+        }
+    }
+
+    /// Offcloud couldn't do it. A dropped connection or a busy Offcloud means trying again
+    /// later; anything else gives TorBox a go, if it can.
+    private func offcloudFailed(_ id: UUID, _ error: Error) async {
+        let message = Self.offcloudText(error)
+        if Self.passing(error) {
+            failResolve(id, message, retryable: true)
+        } else {
+            await serviceFailed(id, .offcloud, message)
+        }
+    }
+
+    /// Offcloud's message, with "Offcloud:" in front unless it already says Offcloud.
+    nonisolated static func offcloudText(_ error: Error) -> String {
+        let text = error.localizedDescription
+        return text.localizedCaseInsensitiveContains("offcloud") ? text : "Offcloud: " + text
+    }
+
+    /// A problem that passes by itself: the connection, or a busy server.
+    nonisolated private static func passing(_ error: Error) -> Bool {
+        if error is URLError { return true }
+        if let offcloud = error as? OffcloudError, case .busy = offcloud { return true }
+        return false
+    }
+
+    /// Sends a torrent to TorBox or Offcloud: the one you prefer first, the other if that one
+    /// can't take it.
+    private func sendTorrent(_ id: UUID, item: DownloadItem, link: URL) async {
+        let tried = item.triedServices ?? []
+        guard let service = preferredServices.first(where: { !tried.contains($0.rawValue) && isActive($0) }) else {
+            failResolve(id, TorBox.shared.hasKey || Offcloud.shared.hasKey
+                ? "Torrents download through TorBox or Offcloud. Switch one on in the ⋯ menu, then tap retry."
+                : "Torrents and magnet links download through TorBox or Offcloud. Add your account in the ⋯ menu, then tap retry.")
+            return
+        }
+        switch service {
+        case .torbox: await sendTorrentToTorBox(id, item: item, link: link)
+        case .offcloud: await sendTorrentToOffcloud(id, item: item, link: link)
+        }
+    }
+
+    private func sendTorrentToTorBox(_ id: UUID, item: DownloadItem, link: URL) async {
         setStatus(id, "Sending to TorBox…")
         do {
             let torrentId: Int
@@ -534,13 +717,7 @@ final class DownloadManager: NSObject, ObservableObject {
                 torrentId = try await TorBox.shared.createTorrent(magnet: link.absoluteString)
             } else {
                 // A link to a .torrent file: fetch the small file, then hand it to TorBox.
-                var req = URLRequest(url: link, timeoutInterval: 30)
-                for (k, v) in item.headers ?? [:] { req.setValue(v, forHTTPHeaderField: k) }
-                let (data, response) = try await URLSession.shared.data(for: req)
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 200
-                guard (200..<300).contains(status), data.first == UInt8(ascii: "d") else {
-                    throw TorBoxError.api("That link didn't give a .torrent file (HTTP \(status)).")
-                }
+                let data = try await fetchTorrentFile(link, headers: item.headers)
                 torrentId = try await TorBox.shared.createTorrent(file: data, name: link.lastPathComponent)
             }
             guard items.contains(where: { $0.id == id }) else { return }
@@ -552,9 +729,47 @@ final class DownloadManager: NSObject, ObservableObject {
             guard isResolving(id) else { return }
             setStatus(id, "Waiting for TorBox…")
             startTorBoxPolling(restart: true)
+        } catch is URLError {
+            failResolve(id, "TorBox: can't connect.", retryable: true)
         } catch {
-            failResolve(id, "TorBox: " + error.localizedDescription)
+            await serviceFailed(id, .torbox, "TorBox: " + error.localizedDescription)
         }
+    }
+
+    /// Offcloud takes torrents as magnet links, so a .torrent file is turned into one first.
+    private func sendTorrentToOffcloud(_ id: UUID, item: DownloadItem, link: URL) async {
+        setStatus(id, "Sending to Offcloud…")
+        let magnet: String
+        do {
+            if let stored = item.torrentFile {
+                let data = try Data(contentsOf: Self.torrentsDir.appendingPathComponent(stored))
+                guard let made = TorrentMagnet.from(data) else { throw OffcloudError.api("That .torrent file couldn't be read.") }
+                magnet = made
+            } else if link.scheme?.lowercased() == "magnet" {
+                magnet = link.absoluteString
+            } else {
+                let data = try await fetchTorrentFile(link, headers: item.headers)
+                guard let made = TorrentMagnet.from(data) else { throw OffcloudError.api("That .torrent file couldn't be read.") }
+                magnet = made
+            }
+        } catch {
+            await offcloudFailed(id, error)
+            return
+        }
+        mutate(id, persist: false) { $0.torboxKind = .torrent }
+        await sendToOffcloudCloud(id, link: magnet)
+    }
+
+    /// Fetches the small .torrent file a link points to.
+    private func fetchTorrentFile(_ link: URL, headers: [String: String]?) async throws -> Data {
+        var req = URLRequest(url: link, timeoutInterval: 30)
+        for (k, v) in headers ?? [:] { req.setValue(v, forHTTPHeaderField: k) }
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 200
+        guard (200..<300).contains(status), data.first == UInt8(ascii: "d") else {
+            throw TorBoxError.api("That link didn't give a .torrent file (HTTP \(status)).")
+        }
+        return data
     }
 
     private func applyResolved(_ id: UUID, _ links: [ResolvedLink]) {
@@ -624,7 +839,7 @@ final class DownloadManager: NSObject, ObservableObject {
                     if isResolving(item.id) {   // not paused or removed meanwhile
                         if let failure = dl.failure {
                             mutate(item.id) { $0.torboxId = nil; $0.cloudProgress = nil }   // retry adds it again
-                            failResolve(item.id, "TorBox: " + failure)
+                            await serviceFailed(item.id, .torbox, "TorBox: " + failure)
                         } else if dl.ready {
                             torboxReady(item.id, webId: webId, download: dl)
                         } else {
@@ -636,7 +851,7 @@ final class DownloadManager: NSObject, ObservableObject {
                     }
                 } catch TorBoxError.gone {
                     mutate(item.id) { $0.torboxId = nil; $0.cloudProgress = nil }
-                    failResolve(item.id, "TorBox: " + (TorBoxError.gone.errorDescription ?? "download gone"))
+                    await serviceFailed(item.id, .torbox, "TorBox: " + (TorBoxError.gone.errorDescription ?? "download gone"))
                 } catch is URLError {
                     let n = (strikes[item.id] ?? 0) + 1
                     strikes[item.id] = n
@@ -680,23 +895,37 @@ final class DownloadManager: NSObject, ObservableObject {
             if let waiting = items.first(where: { $0.id == id }) { Notifier.shared.chooseFiles(waiting) }
             return
         }
-        startFiles(id, webId: webId, files: dl.files, torrentFileCount: dl.files.count, torrentName: name)
+        startFiles(id, source: .torbox(webId), files: dl.files, torrentFileCount: dl.files.count, torrentName: name)
     }
 
     /// Downloads the files you picked from a torrent that was waiting for you.
     func chooseFiles(_ id: UUID, fileIDs: Set<Int>) {
         guard let item = items.first(where: { $0.id == id }), item.state == .choosing,
-              let all = item.choices, let webId = item.torboxId else { return }
+              let all = item.choices else { return }
+        let source: CloudSource
+        if let webId = item.torboxId {
+            source = .torbox(webId)
+        } else if let requestId = item.offcloudId {
+            source = .offcloud(requestId)
+        } else {
+            return
+        }
         let picked = all.filter { fileIDs.contains($0.id) }
         guard !picked.isEmpty else { return }
-        startFiles(id, webId: webId, files: picked, torrentFileCount: all.count,
+        startFiles(id, source: source, files: picked, torrentFileCount: all.count,
                    torrentName: item.groupName ?? item.fileName)
     }
 
-    /// Turns a download TorBox has finished into one download per file. The first file keeps
-    /// the original entry. Files of a torrent with several files go into the torrent's own
-    /// folder, laid out as in the torrent, and show as one group in the list.
-    private func startFiles(_ id: UUID, webId: Int, files: [TorBoxFile], torrentFileCount: Int, torrentName: String) {
+    /// Where a finished cloud download's files come from.
+    private enum CloudSource {
+        case torbox(Int)        // TorBox download or torrent ID: files use TorBox's permanent links
+        case offcloud(String)   // Offcloud request ID: each file has a link of its own
+    }
+
+    /// Turns a download TorBox or Offcloud has finished into one download per file. The first
+    /// file keeps the original entry. Files of a torrent with several files go into the
+    /// torrent's own folder, laid out as in the torrent, and show as one group in the list.
+    private func startFiles(_ id: UUID, source: CloudSource, files: [TorBoxFile], torrentFileCount: Int, torrentName: String) {
         guard let first = files.first, let item = items.first(where: { $0.id == id }) else { return }
         let origin = item.sourceURL ?? item.url
         let several = torrentFileCount > 1
@@ -706,7 +935,17 @@ final class DownloadManager: NSObject, ObservableObject {
             several ? Self.torrentFolder(torrent: torrentName, file: file.path ?? file.name) : nil
         }
         mutate(id, persist: false) {
-            $0.torboxFileId = first.id
+            switch source {
+            case .torbox:
+                $0.torboxFileId = first.id
+            case .offcloud(let requestId):
+                $0.offcloudId = requestId
+                $0.offcloudFile = true
+                $0.viaOffcloud = true
+                if let link = first.link { $0.url = link }
+            }
+            $0.triedServices = nil
+            $0.askOffcloud = nil
             $0.fileName = Self.cleanName(first.name)
             $0.preferredName = Self.cleanName(first.name)
             $0.sourceURL = origin
@@ -722,12 +961,19 @@ final class DownloadManager: NSObject, ObservableObject {
             $0.folder = folder(of: first)
         }
         for file in files.dropFirst() {
-            var extra = DownloadItem(url: origin, fileName: Self.cleanName(file.name))
+            var extra = DownloadItem(url: file.link ?? origin, fileName: Self.cleanName(file.name))
             extra.preferredName = Self.cleanName(file.name)
             extra.sourceURL = origin
-            extra.torboxId = webId
+            switch source {
+            case .torbox(let webId):
+                extra.torboxId = webId
+                extra.torboxFileId = file.id
+            case .offcloud(let requestId):
+                extra.offcloudId = requestId
+                extra.offcloudFile = true
+                extra.viaOffcloud = true
+            }
             extra.torboxKind = item.torboxKind
-            extra.torboxFileId = file.id
             extra.bytesTotal = max(file.size ?? 0, 0)
             extra.addedAt = item.addedAt ?? Date()   // same as the torrent, so its files stay together
             extra.groupID = group
@@ -793,6 +1039,106 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         guard !unfinished else { return }
         Task { try? await TorBox.shared.remove(kind, id: webId) }
+    }
+
+    // MARK: Offcloud
+
+    /// Links and torrents Offcloud is still fetching to its cloud.
+    private var waitingForOffcloud: [DownloadItem] {
+        items.filter { $0.state == .resolving && $0.offcloudId != nil && $0.offcloudFile != true }
+    }
+
+    /// One loop checks everything Offcloud is fetching. `restart` checks a new one at once.
+    private func startOffcloudPolling(restart: Bool = false) {
+        if restart { offcloudPollSoon = true }
+        guard offcloudPoller == nil else { return }
+        offcloudPoller = Task {
+            await self.pollOffcloud()
+            self.offcloudPoller = nil
+        }
+    }
+
+    private func pollOffcloud() async {
+        var delay: Double = 2
+        var strikes: [UUID: Int] = [:]
+        while true {
+            offcloudPollSoon = false
+            let waiting = waitingForOffcloud
+            if waiting.isEmpty { return }
+            for item in waiting {
+                guard let requestId = item.offcloudId, isResolving(item.id) else { continue }
+                do {
+                    let status = try await Offcloud.shared.cloudStatus(requestId)
+                    strikes[item.id] = nil
+                    guard isResolving(item.id) else { continue }   // paused or removed meanwhile
+                    if let failure = status.failure {
+                        mutate(item.id) { $0.offcloudId = nil; $0.cloudProgress = nil }   // retry adds it again
+                        await serviceFailed(item.id, .offcloud, "Offcloud: " + failure)
+                    } else if status.ready {
+                        await offcloudReady(item.id, requestId: requestId, status: status)
+                    } else {
+                        mutate(item.id, persist: false) {
+                            $0.status = status.statusText
+                            $0.cloudProgress = status.fraction
+                        }
+                    }
+                } catch OffcloudError.gone {
+                    mutate(item.id) { $0.offcloudId = nil; $0.cloudProgress = nil }
+                    await serviceFailed(item.id, .offcloud, Self.offcloudText(OffcloudError.gone))
+                } catch let error where Self.passing(error) {
+                    let n = (strikes[item.id] ?? 0) + 1
+                    strikes[item.id] = n
+                    if n >= 6 {
+                        failResolve(item.id, "Offcloud: can't connect.", retryable: true)
+                    } else {
+                        setStatus(item.id, "Offcloud: connection problem, retrying…")
+                    }
+                } catch {
+                    failResolve(item.id, Self.offcloudText(error))
+                }
+            }
+            // Wait 2 s, then a little longer each round, up to 10 s. A new one cuts it short.
+            var waited: Double = 0
+            while waited < delay, !offcloudPollSoon {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                waited += 0.25
+            }
+            delay = offcloudPollSoon ? 2 : min(delay * 1.5, 10)
+        }
+    }
+
+    /// Offcloud has it all: get each file's link, then download them. A torrent with several
+    /// files waits for you to pick which ones, as with TorBox.
+    private func offcloudReady(_ id: UUID, requestId: String, status: OffcloudStatus) async {
+        let files: [TorBoxFile]
+        do {
+            files = try await Offcloud.shared.cloudFiles(requestId, status: status)
+        } catch let error where Self.passing(error) {
+            setStatus(id, "Offcloud: connection problem, retrying…")   // the poller asks again
+            return
+        } catch {
+            guard isResolving(id) else { return }
+            mutate(id) { $0.offcloudId = nil; $0.cloudProgress = nil }
+            await serviceFailed(id, .offcloud, Self.offcloudText(error))
+            return
+        }
+        guard isResolving(id), let item = items.first(where: { $0.id == id }), !files.isEmpty else { return }
+        let name = Self.cleanName(status.fileName.isEmpty ? item.fileName : status.fileName)
+        if item.torboxKind == .torrent, files.count > 1, AppSettings.shared.askTorrentFiles {
+            mutate(id) {
+                $0.state = .choosing
+                $0.choices = files
+                $0.fileName = name
+                $0.groupName = name
+                $0.bytesTotal = files.reduce(Int64(0)) { $0 + max($1.size ?? 0, 0) }
+                $0.status = nil
+                $0.error = nil
+                $0.cloudProgress = nil
+            }
+            if let waiting = items.first(where: { $0.id == id }) { Notifier.shared.chooseFiles(waiting) }
+            return
+        }
+        startFiles(id, source: .offcloud(requestId), files: files, torrentFileCount: files.count, torrentName: name)
     }
 
     private func isResolving(_ id: UUID) -> Bool {
@@ -1421,7 +1767,7 @@ final class DownloadManager: NSObject, ObservableObject {
             $0.error = message
             $0.status = nil
             // Links found by a plugin can expire, so look the page up again on retry.
-            if resolveAgain, $0.torboxFileId == nil, let source = $0.sourceURL, source != $0.url {
+            if resolveAgain, !$0.isCloudFile, let source = $0.sourceURL, source != $0.url {
                 $0.needsResolve = true
             }
         }
@@ -1841,7 +2187,7 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Steps that need the app itself running for a moment (iOS's downloader handles background transfers).
     private var needsAppTime: Bool {
         !probing.isEmpty || !absorbing.isEmpty || !delivering.isEmpty
-            || items.contains { $0.state == .resolving && $0.torboxId == nil }
+            || items.contains { $0.state == .resolving && $0.torboxId == nil && $0.offcloudId == nil }
     }
 
     /// Work that keeps JDLite awake in the background: in-app transfers, downloads waiting
@@ -1881,6 +2227,7 @@ final class DownloadManager: NSObject, ObservableObject {
         inApp = true
         Task { for task in await checks.allTasks { task.cancel() } }   // the in-app poller takes over
         if !waitingForTorBox.isEmpty { startTorBoxPolling() }
+        if !waitingForOffcloud.isEmpty { startOffcloudPolling() }
         networkChanged()   // holds downloads if the network setting doesn't allow them, else starts the queue
         Task { await self.reclaim() }
     }
@@ -1964,7 +2311,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// Asks iOS for a little extra time so in-app steps can finish after you leave the app.
     private func beginFinishUpTime() {
-        guard finishUp == .invalid, needsAppTime || !waitingForTorBox.isEmpty else { return }
+        guard finishUp == .invalid, needsAppTime || !waitingForTorBox.isEmpty || !waitingForOffcloud.isEmpty else { return }
         finishUp = UIApplication.shared.beginBackgroundTask(withName: "Finish up") { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
@@ -2344,9 +2691,9 @@ final class DownloadManager: NSObject, ObservableObject {
             $0.state = .failed
             $0.error = message
             $0.resumeData = nil
-            // Links found by a plugin can expire, so look the page up again on retry.
-            // (TorBox items always start from a fresh TorBox link anyway.)
-            if $0.torboxFileId == nil, let source = $0.sourceURL, source != $0.url {
+            // Links found by a plugin (or Offcloud's instant links) can expire, so look the page
+            // up again on retry. (Files in TorBox's or Offcloud's cloud keep their links.)
+            if !$0.isCloudFile, let source = $0.sourceURL, source != $0.url {
                 $0.needsResolve = true
             }
         }
@@ -2359,13 +2706,42 @@ final class DownloadManager: NSObject, ObservableObject {
         clearTransfer(id)
         bgLive[id] = nil
         try? FileManager.default.removeItem(at: Self.partsDir(id))
+        guard let item = items.first(where: { $0.id == id }) else { return }
+        let source = item.sourceURL ?? item.url
+        // A web page instead of the file usually means the site wants a premium account:
+        // Offcloud has a go, even if it doesn't list the site.
+        if !item.isCloudFile, item.viaOffcloud != true, Offcloud.shared.isActive,
+           !(item.triedServices ?? []).contains(PremiumService.offcloud.rawValue),
+           ["http", "https"].contains(source.scheme?.lowercased() ?? "") {
+            mutate(id) {
+                $0.url = source
+                $0.headers = nil
+                $0.resumeData = nil
+                $0.segments = nil
+                $0.layout = nil
+                $0.bytesReceived = 0
+                $0.state = .resolving
+                $0.needsResolve = true
+                $0.askOffcloud = true
+                $0.error = nil
+                $0.status = "The site sent a web page. Trying Offcloud…"
+            }
+            startNext()
+            Task { await self.runResolve(id) }
+            return
+        }
         let hint: String
-        if TorBox.shared.isActive {
+        var switchedOff: [String] = []
+        if TorBox.shared.hasKey && !TorBox.shared.isActive { switchedOff.append("TorBox") }
+        if Offcloud.shared.hasKey && !Offcloud.shared.isActive { switchedOff.append("Offcloud") }
+        if item.viaOffcloud == true {
+            hint = "Offcloud's link led to a web page too."
+        } else if TorBox.shared.isActive {
             hint = "TorBox doesn't list this site as supported."
-        } else if TorBox.shared.hasKey {
-            hint = "TorBox is switched off in ⋯ › TorBox."
+        } else if !switchedOff.isEmpty {
+            hint = switchedOff.joined(separator: " and ") + (switchedOff.count == 1 ? " is" : " are") + " switched off in the ⋯ menu."
         } else {
-            hint = "For file hosters like this one, add your TorBox API key in ⋯ › TorBox, then tap retry."
+            hint = "For file hosters like this one, add your TorBox or Offcloud account in the ⋯ menu, then tap retry."
         }
         mutate(id) {
             $0.state = .failed
@@ -2374,10 +2750,10 @@ final class DownloadManager: NSObject, ObservableObject {
             $0.layout = nil
             $0.bytesReceived = 0
             $0.error = "Got a web page instead of a file. " + hint
-            if $0.torboxFileId == nil {
+            if !$0.isCloudFile {
                 if let source = $0.sourceURL { $0.url = source }
                 $0.headers = nil
-                $0.needsResolve = true   // retry checks TorBox/plugins again
+                $0.needsResolve = true   // retry checks plugins, TorBox and Offcloud again
             }
         }
         notifyFailed(id)

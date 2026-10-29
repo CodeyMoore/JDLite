@@ -15,11 +15,12 @@ final class Notifier {
         post(id: "done-\(item.id.uuidString)", title: "Download finished", body: item.fileName)
     }
 
-    /// A torrent is ready on TorBox and waits for you to pick which files to download.
+    /// A torrent is ready on TorBox or Offcloud and waits for you to pick which files to download.
     func chooseFiles(_ item: DownloadItem) {
         let count = item.choices?.count ?? 0
+        let service = item.serviceName ?? "TorBox"
         post(id: "choose-\(item.id.uuidString)", title: "Choose files to download",
-             body: "\(item.fileName) is ready on TorBox (\(count) files). Open JDLite to pick which ones you want.")
+             body: "\(item.fileName) is ready on \(service) (\(count) files). Open JDLite to pick which ones you want.")
     }
 
     /// Every file of a torrent has finished.

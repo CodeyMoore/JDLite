@@ -99,7 +99,7 @@ final class LiveActivityController {
 
     private func makeState(running: [DownloadItem], tracked: [DownloadItem], speeds: [UUID: Double]) -> State {
         let downloading = running.filter { $0.state == .downloading }
-        let fetching = running.filter { $0.state == .resolving && $0.torboxId != nil }
+        let fetching = running.filter { $0.state == .resolving && ($0.torboxId != nil || $0.offcloudId != nil) }
         let speed = downloading.reduce(0.0) { $0 + (speeds[$1.id] ?? 0) }
         let sized = tracked.filter { $0.bytesTotal > 0 }
         let total = sized.reduce(Int64(0)) { $0 + $1.bytesTotal }
@@ -107,7 +107,9 @@ final class LiveActivityController {
         let title = running.count == 1 ? running[0].fileName : "\(running.count) downloads"
 
         if downloading.isEmpty, let first = fetching.first {
-            let detail = fetching.count == 1 ? "TorBox is fetching the file" : "TorBox is fetching \(fetching.count) files"
+            let services = Set(fetching.compactMap { $0.serviceName })
+            let who = services.count == 1 ? (services.first ?? "TorBox") : "TorBox and Offcloud"
+            let detail = fetching.count == 1 ? "\(who) is fetching the file" : "\(who) \(services.count == 1 ? "is" : "are") fetching \(fetching.count) files"
             return State(phase: .fetching, title: title, detail: detail,
                          progress: first.cloudProgress ?? 0, count: running.count)
         }
