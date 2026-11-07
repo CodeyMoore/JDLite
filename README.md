@@ -16,7 +16,7 @@ JDLite is a lightweight download manager inspired by jDownloader2, which aims to
 * Simple & Streamlined — Inspired by jDownloader2, with an emphasis on ease of use.
 
 ### Compatibility
-Built and tested for iOS 27 (older iOS version has not been tested) 
+Built and tested for iOS 27 (older iOS version's have not been tested) 
 
 Currently only TorBox has been tested, OffCloud support has been implemented but remains untested (Support for other debrid services has not been implemented).
 
