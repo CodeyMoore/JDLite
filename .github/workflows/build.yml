@@ -120,6 +120,44 @@ jobs:
             echo "$name: $(plutil -extract CFBundleIdentifier raw "$OUT/$name.appex/Info.plist")"
           done
 
+          # Ad-hoc ("fake") signature with entitlements, so jailbroken devices with AppSync
+          # Unified (Filza and the like) accept the IPA: installing fails without an
+          # application-identifier entitlement. Real signing (Flarestore, Sideloadly) replaces it.
+          fakesign() {  # $1 = bundle to sign
+            ID=$(plutil -extract CFBundleIdentifier raw "$1/Info.plist")
+            ENT=$(mktemp)
+            printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0"><dict>' \
+              "<key>application-identifier</key><string>$ID</string>" \
+              "<key>keychain-access-groups</key><array><string>$ID</string></array>" \
+              '<key>get-task-allow</key><true/>' \
+              '</dict></plist>' > "$ENT"
+            codesign -f -s - --entitlements "$ENT" "$1"
+            SIGNED=$(codesign -d --entitlements - "$1" 2>&1)
+            case "$SIGNED" in
+              *"$ID"*) echo "Fake-signed $(basename "$1") as $ID" ;;
+              *) echo "::error::$(basename "$1") wasn't signed with its application-identifier"; exit 1 ;;
+            esac
+          }
+          signframeworks() {  # $1 = bundle whose Frameworks folder to sign, if it has one
+            if [ -d "$1/Frameworks" ]; then
+              find "$1/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) -print0 |
+                while IFS= read -r -d '' f; do codesign -f -s - "$f"; done
+            fi
+          }
+          # Inside out: frameworks and extensions first, the app last (it seals them).
+          for name in JDLiteExtension JDLiteWidgets JDLiteShare; do
+            signframeworks "Payload/JDLite.app/PlugIns/$name.appex"
+            fakesign "Payload/JDLite.app/PlugIns/$name.appex"
+          done
+          signframeworks Payload/JDLite.app
+          fakesign Payload/JDLite.app
+          if ! codesign --verify --deep --strict Payload/JDLite.app; then
+            echo "::error::The fake signature didn't verify"
+            exit 1
+          fi
+
           zip -qr JDLite.ipa Payload
           for f in JDLiteExtension.appex/manifest.json JDLiteWidgets.appex/Info.plist JDLiteShare.appex/Info.plist; do
             if ! unzip -l JDLite.ipa | grep -q "Payload/JDLite.app/PlugIns/$f"; then
