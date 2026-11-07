@@ -4,11 +4,60 @@ name: Build unsigned IPA
 on:
   workflow_dispatch:
 
+# Each successful build saves its version number to version.txt in the repo.
+permissions:
+  contents: write
+
+# Two builds at once would get the same number, so a second one waits its turn.
+concurrency:
+  group: build
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
+
+      # Every build goes up one: 1.6, 1.7 ... 1.9, 2.0, and the build number goes up by one.
+      # version.txt holds the last build's numbers. Without it, they come from project.yml.
+      - name: Set the version number
+        run: |
+          if [ -f version.txt ]; then
+            LAST_VERSION=$(sed -n 's/^version:[[:space:]]*//p' version.txt | head -n 1 | tr -d '[:space:]')
+            LAST_BUILD=$(sed -n 's/^build:[[:space:]]*//p' version.txt | head -n 1 | tr -d '[:space:]')
+          else
+            LAST_VERSION=$(sed -n 's/.*CFBundleShortVersionString:[[:space:]]*"\([^"]*\)".*/\1/p' project.yml | head -n 1)
+            LAST_BUILD=$(sed -n 's/.*CFBundleVersion:[[:space:]]*"\([^"]*\)".*/\1/p' project.yml | head -n 1)
+          fi
+          if ! echo "$LAST_VERSION" | grep -Eq '^[0-9]+\.[0-9]+$' || ! echo "$LAST_BUILD" | grep -Eq '^[0-9]+$'; then
+            echo "::error::Couldn't read the last version (found '$LAST_VERSION' and build '$LAST_BUILD'). version.txt should look like: version: 1.6 / build: 13"
+            exit 1
+          fi
+          MAJOR=${LAST_VERSION%%.*}
+          MINOR=${LAST_VERSION#*.}
+          MINOR=$((10#$MINOR + 1))
+          if [ "$MINOR" -ge 10 ]; then
+            MAJOR=$((10#$MAJOR + 1))
+            MINOR=0
+          fi
+          VERSION="$MAJOR.$MINOR"
+          BUILD=$((10#$LAST_BUILD + 1))
+
+          # The app and all its extensions get the same numbers.
+          VERSION="$VERSION" BUILD="$BUILD" perl -pi -e \
+            's/(CFBundleShortVersionString:\s*)"[^"]*"/$1"$ENV{VERSION}"/; s/(CFBundleVersion:\s*)"[^"]*"/$1"$ENV{BUILD}"/' \
+            project.yml
+          TARGETS=$(grep -c 'CFBundleShortVersionString:' project.yml)
+          if [ "$(grep -c "CFBundleShortVersionString: \"$VERSION\"" project.yml)" != "$TARGETS" ] \
+             || [ "$(grep -c "CFBundleVersion: \"$BUILD\"" project.yml)" != "$TARGETS" ]; then
+            echo "::error::Couldn't set the version number in project.yml"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "BUILD=$BUILD" >> "$GITHUB_ENV"
+          echo "### JDLite $VERSION ($BUILD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Building JDLite $VERSION ($BUILD), after $LAST_VERSION ($LAST_BUILD)"
 
       - name: Generate Xcode project
         run: brew install xcodegen && xcodegen generate
@@ -80,9 +129,29 @@ jobs:
             fi
           done
           echo "Packaged the app with its Safari extension, Live Activity widget and share extension"
+          mv JDLite.ipa "JDLite-$VERSION.ipa"
 
       - uses: actions/upload-artifact@v6
         with:
-          name: JDLite-unsigned-ipa
-          path: JDLite.ipa
+          name: JDLite-${{ env.VERSION }}-unsigned-ipa
+          path: JDLite-${{ env.VERSION }}.ipa
           compression-level: 0
+
+      # Only a build that worked uses up a number. Saving it here means the next build
+      # goes up from this one.
+      - name: Save the version number
+        run: |
+          git checkout -- project.yml
+          printf 'version: %s\nbuild: %s\n' "$VERSION" "$BUILD" > version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add version.txt
+          git commit -q -m "Version $VERSION ($BUILD)"
+          for attempt in 1 2 3; do
+            if git pull -q --rebase origin "$GITHUB_REF_NAME" && git push -q origin "HEAD:$GITHUB_REF_NAME"; then
+              echo "Saved version $VERSION ($BUILD) to version.txt"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::warning::The IPA is fine, but version.txt couldn't be saved, so the next build will get $VERSION again"

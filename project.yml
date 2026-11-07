@@ -33,6 +33,7 @@ targets:
       path: JDLite/Info.plist
       properties:
         CFBundleDisplayName: JDLite
+        # The build workflow sets both numbers here and in every target, from version.txt.
         CFBundleShortVersionString: "1.6"
         CFBundleVersion: "13"
         UILaunchScreen: {}
